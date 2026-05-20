@@ -32,30 +32,18 @@ def _ensure_reasoning_store() -> None:
     init_reasoning_store(cfg.storage.root_dir)
     _reasoning_inited = True
 
-_ANTHROPIC_MODEL_ALIAS_MAP = {
-    "Pro[1m]": "Pro",
-    "Flash[1m]": "Flash",
-}
-
 def _normalize_anthropic_model(model_id: Any) -> Any:
+    """Strip [1m] suffix from incoming model names (backward compat)."""
     if not isinstance(model_id, str):
         return model_id
-    return _ANTHROPIC_MODEL_ALIAS_MAP.get(model_id, model_id)
+    if model_id.endswith("[1m]"):
+        return model_id[:-4]
+    return model_id
 
 
 def _anthropic_exposed_models(models: list[str]) -> list[str]:
-    exposed: list[str] = []
-    for model in models:
-        if not model:
-            continue
-        if model == "Pro":
-            exposed.append("Pro[1m]")
-            continue
-        if model == "Flash":
-            exposed.append("Flash[1m]")
-            continue
-        exposed.append(model)
-    return exposed
+    """Pass through model names as-is. Dynamic models come from LiteLLM."""
+    return [m for m in models if m]
 
 
 def _content_blocks_to_text(blocks: Any) -> str:
