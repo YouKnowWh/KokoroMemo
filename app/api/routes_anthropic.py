@@ -11,23 +11,26 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.protocol_common import format_model_item, get_exposed_models
 from app.pipeline.chat import ChatPipeline
-
-
-# === DeepSeek reasoning_content cache (must pass back in multi-turn tool calls) ===
-_reasoning_store: dict[str, str] = {}
-
-
-def _save_reasoning(tool_call_id: str, reasoning: str) -> None:
-    if reasoning and tool_call_id:
-        _reasoning_store[tool_call_id] = reasoning
-
-
-def _get_reasoning(tool_call_id: str) -> str:
-    return _reasoning_store.get(tool_call_id, "")
-
-
+from app.storage.reasoning_store import (
+    save_reasoning as _save_reasoning,
+    get_reasoning as _get_reasoning,
+    init_reasoning_store,
+    cleanup_old_reasoning,
+)
 
 router = APIRouter()
+
+_reasoning_inited = False
+
+
+def _ensure_reasoning_store() -> None:
+    global _reasoning_inited
+    if _reasoning_inited:
+        return
+    from app.core.state import get_config
+    cfg = get_config()
+    init_reasoning_store(cfg.storage.root_dir)
+    _reasoning_inited = True
 
 _ANTHROPIC_MODEL_ALIAS_MAP = {
     "Coder[1m]": "Coder",
@@ -113,7 +116,6 @@ def _anthropic_to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[s
                 # Look up reasoning by the first tool_call's ID
                 first_tc_id = tool_calls[0].get("id") if tool_calls else ""
                 reasoning = _get_reasoning(first_tc_id) if first_tc_id else ""
-                print(f"[REASONING POP] tc_id={first_tc_id[:20]} found={bool(reasoning)}", flush=True)
                 if reasoning:
                     assistant_message["reasoning_content"] = reasoning
             result.append(assistant_message)
@@ -249,9 +251,6 @@ def _openai_response_to_anthropic(data: dict[str, Any], request_body: dict[str, 
             tc_id = tc.get("id") or ""
             if tc_id:
                 _save_reasoning(tc_id, reasoning)
-                print(f"[REASONING SAVE] tc_id={tc_id[:20]} len={len(reasoning)}", flush=True)
-    else:
-        print(f"[REASONING SAVE] no reasoning_content", flush=True)
     content_blocks = _openai_message_to_anthropic_content(message)
     finish_reason = choices[0].get("finish_reason") if choices else None
     stop_reason = "tool_use" if message.get("tool_calls") else "end_turn"
@@ -380,6 +379,7 @@ async def anthropic_messages_info():
 
 @router.post("/anthropic/v1/messages")
 async def anthropic_messages(request: Request):
+    _ensure_reasoning_store()
     raw_body = await request.json()
     openai_body = _anthropic_request_to_openai(raw_body)
     pipeline_response = await ChatPipeline().handle(request, raw_body=openai_body)
