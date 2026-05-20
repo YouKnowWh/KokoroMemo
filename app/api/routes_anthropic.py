@@ -373,6 +373,11 @@ async def list_models():
     }
 
 
+@router.get("/anthropic/v1/messages")
+async def anthropic_messages_info():
+    return {"endpoint": "/anthropic/v1/messages", "method": "POST", "anthropic_version": "2023-06-01"}
+
+
 @router.post("/anthropic/v1/messages")
 async def anthropic_messages(request: Request):
     raw_body = await request.json()
