@@ -45,11 +45,14 @@ def _fetch_models_from_litellm() -> list[str]:
         if r.status_code == 200:
             data = r.json()
             all_models = [m["id"] for m in data.get("data", [])]
-            # Filter: only chat models (not embedding/reranker/internal)
-            excluded = {"Embedder", "Ranker"}
-            chat_models = [m for m in all_models if m not in excluded and not m.startswith("Qwen") and not m.startswith("bge")]
+            # Filter out embedding/reranker models
+            _NON_CHAT_PATTERNS = {"embed", "rerank", "bge", "qwen"}
+            chat_models = [
+                m for m in all_models
+                if not any(p in m.lower() for p in _NON_CHAT_PATTERNS)
+            ]
             _litellm_models_cache = {"models": chat_models, "fetched_at": now}
-            logger.info("Fetched %d models from LiteLLM (filtered from %d)", len(chat_models), len(all_models))
+            logger.info("Fetched %d chat models from LiteLLM (filtered from %d)", len(chat_models), len(all_models))
             return chat_models
     except Exception as e:
         logger.warning("Failed to fetch models from LiteLLM: %s", e)
