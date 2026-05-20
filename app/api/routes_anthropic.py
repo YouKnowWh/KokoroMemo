@@ -33,8 +33,8 @@ def _ensure_reasoning_store() -> None:
     _reasoning_inited = True
 
 _ANTHROPIC_MODEL_ALIAS_MAP = {
-    "Coder[1m]": "Coder",
-    "Chatter[1m]": "Chatter",
+    "Pro[1m]": "Pro",
+    "Flash[1m]": "Flash",
 }
 
 def _normalize_anthropic_model(model_id: Any) -> Any:
@@ -48,11 +48,11 @@ def _anthropic_exposed_models(models: list[str]) -> list[str]:
     for model in models:
         if not model:
             continue
-        if model == "Coder":
-            exposed.append("Coder[1m]")
+        if model == "Pro":
+            exposed.append("Pro[1m]")
             continue
-        if model == "Chatter":
-            exposed.append("Chatter[1m]")
+        if model == "Flash":
+            exposed.append("Flash[1m]")
             continue
         exposed.append(model)
     return exposed
