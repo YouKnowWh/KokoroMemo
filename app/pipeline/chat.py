@@ -18,6 +18,7 @@ from app.core.ids import generate_id
 from app.core.services import ServiceRegistry, get_service_registry
 from app.core.state import get_config
 from app.memory.card_injector import inject_cards
+from app.memory.context_embedding_cache import get_context_cache
 from app.memory.query_builder import build_retrieval_query
 from app.memory.retrieval_gate import RetrievalGateInput, decide_retrieval
 from app.memory.state_injector import inject_state_board
@@ -75,15 +76,16 @@ class ChatPipeline:
     def __init__(self, services: ServiceRegistry | None = None) -> None:
         self.services = services or get_service_registry()
 
-    async def handle(self, request: Request):
-        prepared = await self.prepare(request)
+    async def handle(self, request: Request, raw_body: dict[str, Any] | None = None):
+        prepared = await self.prepare(request, raw_body=raw_body)
         await self.inject_state(prepared)
         await self.inject_memory(prepared)
         return await self.forward(prepared)
 
-    async def prepare(self, request: Request) -> ChatPipelineContext:
+    async def prepare(self, request: Request, raw_body: dict[str, Any] | None = None) -> ChatPipelineContext:
         cfg = get_config()
-        raw_body: dict[str, Any] = await request.json()
+        if raw_body is None:
+            raw_body = await request.json()
         ctx = await resolve_context(request, raw_body, cfg.storage.root_dir, cfg)
         await _persist_request(cfg, ctx, deepcopy(raw_body))
 
@@ -232,7 +234,7 @@ class ChatPipeline:
         client_api_key = client_auth.replace("Bearer ", "").strip() if client_auth.startswith("Bearer ") else ""
         client_model = raw_body.get("model", "")
         if cfg.llm.forward_mode == "passthrough":
-            final_api_key = client_api_key or cfg.llm.get_api_key()
+            final_api_key = cfg.llm.get_api_key() or client_api_key
             final_model = client_model or cfg.llm.model
         else:
             final_api_key = cfg.llm.get_api_key()
@@ -539,61 +541,70 @@ async def _update_state_and_extract_memories(
                     logger.warning("State updater failed: %s", exc)
 
     if not cfg.memory.enabled or not cfg.memory.extraction_enabled:
-        return
-    if memory_write_policy == "disabled":
+        extraction_enabled = False
+    elif memory_write_policy == "disabled":
         logger.info("Memory extraction skipped for conv=%s by policy=disabled", ctx.conversation_id)
-        return
-    if not assistant_text:
-        return
+        extraction_enabled = False
+    elif not assistant_text:
+        extraction_enabled = False
+    elif not _latest_user_message(original_messages):
+        extraction_enabled = False
+    else:
+        extraction_enabled = True
 
-    user_msg = _latest_user_message(original_messages)
-    if not user_msg:
-        return
+    if extraction_enabled:
+        user_msg = _latest_user_message(original_messages)
+        try:
+            from app.memory.card_extractor import extract_and_route
+            from app.memory.judge import MemoryJudgeConfigView
 
-    try:
-        from app.memory.card_extractor import extract_and_route
-        from app.memory.judge import MemoryJudgeConfigView
+            ep = services.get_embedding_provider(cfg)
+            store = services.get_lancedb_store(cfg)
+            judge_config = None
+            if cfg.memory.judge.enabled:
+                user_rules = cfg.memory.judge.user_rules
+                if memory_write_policy == "stable_only":
+                    user_rules = (
+                        f"{user_rules}\n\n"
+                        "当前会话策略为 stable_only：只允许用户偏好、角色稳定设定、世界观常识、稳定关系等长期事实进入记忆候选；"
+                        "临时事件、机械状态、剧情进度、资源变化、任务进度、小人即时状态等必须判为不写入长期记忆。"
+                    ).strip()
+                judge_config = MemoryJudgeConfigView(
+                    provider=cfg.memory.judge.provider,
+                    base_url=cfg.memory.judge.base_url or cfg.llm.base_url,
+                    api_key=cfg.memory.judge.get_api_key() or cfg.llm.get_api_key(),
+                    model=cfg.memory.judge.model or cfg.llm.model,
+                    timeout_seconds=cfg.memory.judge.timeout_seconds,
+                    temperature=cfg.memory.judge.temperature,
+                    mode=cfg.memory.judge.mode,
+                    user_rules=user_rules,
+                    prompt=cfg.memory.judge.prompt,
+                )
 
-        ep = services.get_embedding_provider(cfg)
-        store = services.get_lancedb_store(cfg)
-        judge_config = None
-        if cfg.memory.judge.enabled:
-            user_rules = cfg.memory.judge.user_rules
-            if memory_write_policy == "stable_only":
-                user_rules = (
-                    f"{user_rules}\n\n"
-                    "当前会话策略为 stable_only：只允许用户偏好、角色稳定设定、世界观常识、稳定关系等长期事实进入记忆候选；"
-                    "临时事件、机械状态、剧情进度、资源变化、任务进度、小人即时状态等必须判为不写入长期记忆。"
-                ).strip()
-            judge_config = MemoryJudgeConfigView(
-                provider=cfg.memory.judge.provider,
-                base_url=cfg.memory.judge.base_url or cfg.llm.base_url,
-                api_key=cfg.memory.judge.get_api_key() or cfg.llm.get_api_key(),
-                model=cfg.memory.judge.model or cfg.llm.model,
-                timeout_seconds=cfg.memory.judge.timeout_seconds,
-                temperature=cfg.memory.judge.temperature,
-                mode=cfg.memory.judge.mode,
-                user_rules=user_rules,
-                prompt=cfg.memory.judge.prompt,
+            await extract_and_route(
+                db_path=cfg.storage.sqlite.memory_db,
+                user_message=user_msg,
+                assistant_message=assistant_text,
+                user_id=ctx.user_id,
+                character_id=ctx.character_id,
+                conversation_id=ctx.conversation_id,
+                embedding_provider=ep,
+                lancedb_store=store,
+                min_importance=cfg.memory.extraction.min_importance,
+                min_confidence=cfg.memory.extraction.min_confidence,
+                judge_config=judge_config,
+                lang=cfg.language,
+                discarded_keep_limit=cfg.memory.extraction.discarded_keep_limit,
             )
+        except Exception as exc:
+            logger.warning("Memory extraction failed: %s", exc)
 
-        await extract_and_route(
-            db_path=cfg.storage.sqlite.memory_db,
-            user_message=user_msg,
-            assistant_message=assistant_text,
-            user_id=ctx.user_id,
-            character_id=ctx.character_id,
-            conversation_id=ctx.conversation_id,
-            embedding_provider=ep,
-            lancedb_store=store,
-            min_importance=cfg.memory.extraction.min_importance,
-            min_confidence=cfg.memory.extraction.min_confidence,
-            judge_config=judge_config,
-            lang=cfg.language,
-            discarded_keep_limit=cfg.memory.extraction.discarded_keep_limit,
-        )
-    except Exception as exc:
-        logger.warning("Memory extraction failed: %s", exc)
+    # Precompute context embedding for the next retrieval turn
+    if cfg.memory.enabled and cfg.embedding.enabled and assistant_text and original_messages:
+        try:
+            await _precompute_context_embedding(cfg, services, ctx, original_messages, assistant_text, turn_index)
+        except Exception as exc:
+            logger.warning("Context embedding precomputation failed (degraded): %s", exc)
 
 
 def _latest_user_message(messages: list[dict]) -> str:
@@ -608,6 +619,130 @@ def _should_run_state_updater(cfg, turn_index: int | None) -> bool:
     if every_n <= 1 or turn_index is None:
         return True
     return turn_index % every_n == 0
+
+
+def _build_recent_context_text(messages: list[dict], assistant_text: str, max_turns: int) -> str:
+    """Build a recent context string (last N turns including the latest assistant response)."""
+    non_system = [m for m in messages if m.get("role") != "system"]
+    recent = non_system[-(max_turns * 2):]
+    recent.append({"role": "assistant", "content": assistant_text})
+
+    lines = []
+    for m in recent:
+        role = m.get("role", "")
+        content = m.get("content", "")[:120]
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+_CONTEXT_REFRESH_INTERVAL = 3  # force refresh every N turns regardless of topic
+
+
+async def _check_topic_changed(prev_context: str, curr_context: str, cfg) -> bool:
+    """Ask LLM whether the latest messages introduce a new topic."""
+    if not prev_context.strip():
+        return True
+
+    # Only compare the new portion: last 300 chars of current vs last 300 of previous
+    prev_tail = prev_context[-300:].strip()
+    curr_tail = curr_context[-300:].strip()
+    if not curr_tail or curr_tail == prev_tail:
+        return False
+
+    prompt = (
+        "Does the SECOND text introduce a clearly different topic from the FIRST?\n\n"
+        f"FIRST:\n{prev_tail}\n\n"
+        f"SECOND:\n{curr_tail}\n\n"
+        "Answer ONLY the word YES or NO. Do not explain."
+    )
+
+    try:
+        base_url = cfg.memory.judge.base_url or cfg.llm.base_url
+        api_key = cfg.memory.judge.get_api_key() or cfg.llm.get_api_key()
+        model = cfg.memory.judge.model or cfg.llm.model
+        if not base_url or not api_key:
+            return True
+
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a classifier. Output only YES or NO. No reasoning."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 100,
+                "temperature": 0,
+            }, headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            })
+            if resp.status_code != 200:
+                logger.warning("Topic check LLM returned %d, defaulting to refresh", resp.status_code)
+                return True
+            body = resp.json()
+            msg = body["choices"][0]["message"]
+            answer = (msg.get("content") or msg.get("reasoning_content") or "").strip().upper()
+            if not answer:
+                logger.info("Topic check: empty answer, defaulting to refresh")
+                return True
+            # Try prefix first, then search anywhere
+            if answer.startswith("YES"):
+                changed = True
+            elif answer.startswith("NO"):
+                changed = False
+            elif "YES" in answer and "NO" not in answer:
+                changed = True
+            elif "NO" in answer and "YES" not in answer:
+                changed = False
+            else:
+                logger.info("Topic check: ambiguous answer, defaulting to refresh. answer=%s", answer[:60])
+                return True
+            logger.info("Topic check: prev_tail=%d curr_tail=%d changed=%s answer=%s",
+                        len(prev_tail), len(curr_tail), changed, answer[:40])
+            return changed
+    except Exception as exc:
+        logger.warning("Topic check failed (degraded, will refresh): %s", exc)
+        return True
+
+
+async def _precompute_context_embedding(cfg, services, ctx, original_messages: list[dict],
+                                         assistant_text: str, turn_index: int | None = None) -> None:
+    """Precompute and cache the embedding of the recent conversation context.
+
+    Skips refresh unless topic has changed or N turns have passed since last refresh.
+    """
+    ep = services.get_embedding_provider(cfg)
+    if not ep:
+        return
+
+    context_text = _build_recent_context_text(
+        original_messages, assistant_text, cfg.memory.max_recent_turns_for_query,
+    )
+    if not context_text.strip():
+        return
+
+    cache = get_context_cache()
+    turn = turn_index or 0
+    prev_text, last_turn = cache.get_meta(ctx.conversation_id)
+
+    should_refresh = True
+    if prev_text and last_turn is not None:
+        turns_since = turn - last_turn
+        if turns_since >= _CONTEXT_REFRESH_INTERVAL:
+            logger.info("Context refresh forced (N=%d): conv=%s turns_since=%d", _CONTEXT_REFRESH_INTERVAL, ctx.conversation_id[:12], turns_since)
+        else:
+            topic_changed = await _check_topic_changed(prev_text, context_text, cfg)
+            if not topic_changed:
+                should_refresh = False
+                logger.info("Context refresh skipped (topic unchanged): conv=%s turns_since=%d", ctx.conversation_id[:12], turns_since)
+            else:
+                logger.info("Context refresh triggered (topic changed): conv=%s turns_since=%d", ctx.conversation_id[:12], turns_since)
+
+    if should_refresh:
+        vector = await ep.embed_text(context_text)
+        cache.put(ctx.conversation_id, ep.model, vector, context_text=context_text, turn_index=turn)
+        logger.info("Context embedding refreshed: conv=%s chars=%d turn=%d", ctx.conversation_id[:12], len(context_text), turn)
 
 
 async def _non_stream_proxy(provider, body: dict, timeout: int, ctx: RequestContext, cfg, original_messages: list[dict], services: ServiceRegistry) -> JSONResponse:

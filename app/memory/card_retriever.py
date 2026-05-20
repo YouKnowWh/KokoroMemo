@@ -18,6 +18,8 @@ from datetime import datetime
 from app.core.time_util import naive_local_now
 
 from app.memory.query_builder import RetrievalQuery
+from app.memory.retrieval_embedding_cache import get_retrieval_cache
+from app.memory.context_embedding_cache import get_context_cache
 from app.providers.embedding_base import EmbeddingProvider
 from app.memory.graph import get_active_edges_for_cards
 from app.storage.sqlite_cards import get_cards_by_ids, get_pinned_cards, get_recent_important_cards
@@ -64,6 +66,36 @@ def _recency_score(created_at: str | None) -> float:
 
 def _scope_score(scope: str) -> float:
     return {"conversation": 1.0, "character": 0.85, "global": 0.70}.get(scope, 0.5)
+
+
+async def _resolve_query_vector(
+    embedding_provider: EmbeddingProvider,
+    query: RetrievalQuery,
+    conversation_id: str | None,
+) -> list[float]:
+    """Resolve the embedding vector for a retrieval query, using caches when possible.
+
+    Priority: context cache (precomputed) > retrieval cache (exact match) > live API.
+    """
+    # 1. Context cache: precomputed conversation embedding from post-processing
+    if conversation_id:
+        ctx_cache = get_context_cache()
+        ctx_vector = ctx_cache.get(conversation_id)
+        if ctx_vector is not None:
+            logger.debug("Context embedding cache hit for conv=%s", conversation_id)
+            return ctx_vector
+
+    # 2. Retrieval cache: exact query match (same query text, same model)
+    ret_cache = get_retrieval_cache()
+    query_vector = ret_cache.get(embedding_provider.model, query.query_text)
+    if query_vector is not None:
+        logger.debug("Retrieval embedding cache hit for conv=%s", conversation_id)
+        return query_vector
+
+    # 3. Live embedding API call
+    query_vector = await embedding_provider.embed_text(query.query_text)
+    ret_cache.put(embedding_provider.model, query.query_text, query_vector)
+    return query_vector
 
 
 async def retrieve_cards(
@@ -129,7 +161,7 @@ async def retrieve_cards(
 
     # --- 路径 2：向量召回（LanceDB）---
     try:
-        query_vector = await embedding_provider.embed_text(query.query_text)
+        query_vector = await _resolve_query_vector(embedding_provider, query, conversation_id)
 
         # 构建作用域过滤条件
         clauses = ["status = 'active'", f"user_id = '{user_id}'"]
