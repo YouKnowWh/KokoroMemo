@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from copy import deepcopy
@@ -68,6 +69,26 @@ class ChatPipelineContext:
     should_inject_memory: bool
     state_row_count: int = 0
     avg_state_confidence: float | None = None
+
+
+async def _resolve_and_retrieve(query, ep, store, cfg, ctx, prepared, services) -> list:
+    """Resolve embedding and retrieve cards. Designed to run in background while gate runs."""
+    from app.memory.card_retriever import retrieve_cards
+
+    allowed_scopes = {
+        scope for scope, enabled in (
+            ("global", cfg.memory.scopes.include_global),
+            ("character", cfg.memory.scopes.include_character),
+            ("conversation", cfg.memory.scopes.include_conversation),
+        ) if enabled
+    }
+    return await retrieve_cards(
+        query, ep, store,
+        cards_db_path=cfg.storage.sqlite.memory_db,
+        vector_top_k=cfg.memory.vector_top_k,
+        final_top_k=cfg.memory.final_top_k,
+        allowed_scopes=allowed_scopes,
+    )
 
 
 class ChatPipeline:
@@ -158,6 +179,19 @@ class ChatPipeline:
                 ctx.conversation_id,
                 max_recent_turns=cfg.memory.max_recent_turns_for_query,
             )
+
+            ep = self.services.get_embedding_provider(cfg)
+            store = self.services.get_lancedb_store(cfg)
+            if not ep or not store:
+                return
+
+            from app.memory.card_retriever import retrieve_cards
+
+            # Fire embedding in background while gate runs
+            embed_task = asyncio.create_task(
+                _resolve_and_retrieve(query, ep, store, cfg, ctx, prepared, self.services)
+            )
+
             should_retrieve = True
             if cfg.memory.retrieval_gate.enabled:
                 turn_index = await get_turn_count(ctx.chat_db_path, ctx.conversation_id)
@@ -180,31 +214,14 @@ class ChatPipeline:
                 await self._record_retrieval_decision(prepared, query, decision, turn_index)
 
             if not should_retrieve:
+                embed_task.cancel()
+                try:
+                    await embed_task
+                except (asyncio.CancelledError, Exception):
+                    pass
                 return
 
-            ep = self.services.get_embedding_provider(cfg)
-            store = self.services.get_lancedb_store(cfg)
-            if not ep or not store:
-                return
-
-            from app.memory.card_retriever import retrieve_cards
-
-            allowed_scopes = {
-                scope for scope, enabled in (
-                    ("global", cfg.memory.scopes.include_global),
-                    ("character", cfg.memory.scopes.include_character),
-                    ("conversation", cfg.memory.scopes.include_conversation),
-                ) if enabled
-            }
-            candidates = await retrieve_cards(
-                query,
-                ep,
-                store,
-                cards_db_path=cfg.storage.sqlite.memory_db,
-                vector_top_k=cfg.memory.vector_top_k,
-                final_top_k=cfg.memory.final_top_k,
-                allowed_scopes=allowed_scopes,
-            )
+            candidates = await embed_task
             if candidates:
                 prepared.injected_messages = inject_cards(
                     prepared.injected_messages,
