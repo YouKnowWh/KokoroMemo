@@ -1,4 +1,4 @@
-"""Tests for memory card deduplication and merge logic (Phase 1)."""
+"""Tests for memory card deduplication and merge logic (Phase 1 + Phase 3)."""
 
 from __future__ import annotations
 
@@ -19,13 +19,20 @@ from app.memory.dedup import (
     same_scope_bucket,
     sync_after_card_merge,
 )
+from app.memory.card_extractor import (
+    default_card_title,
+    enrich_existing_card_from_duplicate_candidate,
+)
+from app.memory.judge import ExtractedMemory
 from app.storage.sqlite_cards import (
+    find_duplicate_card,
     find_exact_duplicate_groups,
     insert_card,
     insert_card_event,
     init_cards_db,
     merge_memory_cards,
     get_cards_by_ids,
+    DEFAULT_MEMORY_LIBRARY_ID,
 )
 
 
@@ -571,5 +578,522 @@ async def test_sync_after_card_merge_handles_none_embedding_provider():
 
         assert result["survivor_resynced"] is False
         assert result["vectors_deleted"] == 1
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+# ============================================================================
+# Phase 3: Extraction-Time Dedup Improvements
+# ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# default_card_title tests
+# ---------------------------------------------------------------------------
+
+
+def test_default_card_title_uses_first_sentence_period():
+    assert default_card_title("Hello world. This is more.", "preference") == "Hello world."
+
+
+def test_default_card_title_uses_first_sentence_chinese():
+    assert default_card_title("用户喜欢安静的环境。不喜欢噪音。", "preference") == "用户喜欢安静的环境。"
+
+
+def test_default_card_title_uses_first_sentence_newline():
+    assert default_card_title("First line\nSecond line", "fact") == "First line"
+
+
+def test_default_card_title_truncates_long_no_separator():
+    result = default_card_title("A" * 200, "preference")
+    assert len(result) <= 80
+    assert result.endswith("…")
+
+
+def test_default_card_title_empty_content():
+    assert default_card_title("", "fact") == "fact"
+
+
+def test_default_card_title_strips_whitespace():
+    assert default_card_title("   Hello world.   ", "preference") == "Hello world."
+
+
+# ---------------------------------------------------------------------------
+# ExtractedMemory title field
+# ---------------------------------------------------------------------------
+
+
+def test_extracted_memory_title_defaults_to_none():
+    mem = ExtractedMemory(
+        scope="character",
+        memory_type="preference",
+        content="Likes quiet",
+        importance=0.8,
+        confidence=0.9,
+        tags=["preference"],
+    )
+    assert mem.title is None
+
+
+def test_extracted_memory_title_can_be_set():
+    mem = ExtractedMemory(
+        scope="character",
+        memory_type="preference",
+        content="Likes quiet",
+        importance=0.8,
+        confidence=0.9,
+        tags=["preference"],
+        title="Quiet preference",
+    )
+    assert mem.title == "Quiet preference"
+
+
+# ---------------------------------------------------------------------------
+# find_duplicate_card scoped tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_exact_content_match():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet environments", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="preference",
+            content="Likes quiet environments",
+        )
+        assert result is not None
+        assert result["card_id"] == "card_1"
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_different_library_not_match():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id="lib_other",
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="preference",
+            content="Likes quiet",
+        )
+        assert result is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_different_character_not_match():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch2",
+            scope="character",
+            card_type="preference",
+            content="Likes quiet",
+        )
+        assert result is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_different_scope_not_match():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="global",
+            card_type="preference",
+            content="Likes quiet",
+        )
+        assert result is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_different_type_not_match():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="fact",
+            content="Likes quiet",
+        )
+        assert result is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_normalized_content_match():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="你好世界", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="preference",
+            content="你好世界！",  # different punctuation, normalized match
+            normalized_content=normalize_card_content("你好世界！"),
+        )
+        assert result is not None
+        assert result["card_id"] == "card_1"
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_returns_none_for_no_match():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="preference",
+            content="No such card exists",
+        )
+        assert result is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_ignores_deleted_cards():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Deleted content", status="deleted",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="preference",
+            content="Deleted content",
+        )
+        assert result is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+# ---------------------------------------------------------------------------
+# enrich_existing_card_from_duplicate_candidate tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enrich_existing_card_updates_importance_and_confidence():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", importance=0.6, confidence=0.7,
+            status="approved", library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        await enrich_existing_card_from_duplicate_candidate(
+            db_path,
+            existing_card={"card_id": "card_1", "importance": 0.6, "confidence": 0.7, "content": "Likes quiet", "card_type": "preference"},
+            new_importance=0.9,
+            new_confidence=0.85,
+            new_turn_id="turn_2",
+        )
+
+        cards = await get_cards_by_ids(db_path, ["card_1"])
+        assert cards["card_1"]["importance"] == 0.9
+        assert cards["card_1"]["confidence"] == 0.85
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_enrich_existing_card_keeps_higher_existing_values():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", importance=0.95, confidence=0.90,
+            status="approved", library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        await enrich_existing_card_from_duplicate_candidate(
+            db_path,
+            existing_card={"card_id": "card_1", "importance": 0.95, "confidence": 0.90, "content": "Likes quiet", "card_type": "preference"},
+            new_importance=0.5,
+            new_confidence=0.3,
+            new_turn_id="turn_2",
+        )
+
+        cards = await get_cards_by_ids(db_path, ["card_1"])
+        assert cards["card_1"]["importance"] == 0.95
+        assert cards["card_1"]["confidence"] == 0.90
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_enrich_existing_card_unions_source_turn_ids():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", importance=0.6, confidence=0.7,
+            status="approved", library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+        # Pre-set source_turn_ids
+        import aiosqlite, json as _json
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "UPDATE memory_cards SET source_turn_ids_json = ? WHERE card_id = ?",
+                (_json.dumps(["turn_1"]), "card_1"),
+            )
+            await db.commit()
+
+        await enrich_existing_card_from_duplicate_candidate(
+            db_path,
+            existing_card={"card_id": "card_1", "importance": 0.6, "confidence": 0.7,
+                           "content": "Likes quiet", "card_type": "preference",
+                           "source_turn_ids_json": '["turn_1"]'},
+            new_importance=0.8,
+            new_confidence=0.8,
+            new_turn_id="turn_2",
+        )
+
+        cards = await get_cards_by_ids(db_path, ["card_1"])
+        turn_ids = _json.loads(cards["card_1"]["source_turn_ids_json"])
+        assert "turn_1" in turn_ids
+        assert "turn_2" in turn_ids
+        assert len(turn_ids) == 2
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_enrich_existing_card_writes_version_for_audit():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", importance=0.6, confidence=0.7,
+            status="approved", library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        await enrich_existing_card_from_duplicate_candidate(
+            db_path,
+            existing_card={"card_id": "card_1", "importance": 0.6, "confidence": 0.7, "content": "Likes quiet", "card_type": "preference"},
+            new_importance=0.8,
+            new_confidence=0.9,
+            new_turn_id="turn_2",
+        )
+
+        with sqlite3.connect(db_path) as conn:
+            versions = conn.execute(
+                "SELECT COUNT(*) FROM memory_card_versions WHERE card_id = ?",
+                ("card_1",),
+            ).fetchone()[0]
+            assert versions >= 1
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_enrich_existing_card_handles_null_existing_turns():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", importance=0.6, confidence=0.7,
+            status="approved", library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        await enrich_existing_card_from_duplicate_candidate(
+            db_path,
+            existing_card={"card_id": "card_1", "importance": 0.6, "confidence": 0.7, "content": "Likes quiet", "card_type": "preference"},
+            new_importance=0.8,
+            new_confidence=0.9,
+            new_turn_id="turn_1",
+        )
+
+        cards = await get_cards_by_ids(db_path, ["card_1"])
+        import json as _json
+        turn_ids = _json.loads(cards["card_1"]["source_turn_ids_json"])
+        assert turn_ids == ["turn_1"]
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_enrich_existing_card_null_turn_id_no_change():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Likes quiet", importance=0.6, confidence=0.7,
+            status="approved", library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        await enrich_existing_card_from_duplicate_candidate(
+            db_path,
+            existing_card={"card_id": "card_1", "importance": 0.6, "confidence": 0.7, "content": "Likes quiet", "card_type": "preference"},
+            new_importance=0.8,
+            new_confidence=0.9,
+            new_turn_id=None,
+        )
+
+        cards = await get_cards_by_ids(db_path, ["card_1"])
+        assert cards["card_1"]["importance"] == 0.8
+        assert cards["card_1"]["source_turn_ids_json"] is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+# ---------------------------------------------------------------------------
+# insert_card with source_turn_ids_json
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_insert_card_stores_source_turn_ids_json():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_t1", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Test content", status="approved",
+            source_turn_ids_json='["turn_1","turn_2"]',
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        cards = await get_cards_by_ids(db_path, ["card_t1"])
+        assert cards["card_t1"]["source_turn_ids_json"] == '["turn_1","turn_2"]'
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_insert_card_null_source_turn_ids_json():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_t2", user_id="u1", character_id=None,
+            conversation_id="conv2", scope="global", card_type="fact",
+            content="Some fact", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        cards = await get_cards_by_ids(db_path, ["card_t2"])
+        assert cards["card_t2"]["source_turn_ids_json"] is None
     finally:
         cleanup_test_dir(test_dir)

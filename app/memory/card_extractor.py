@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import logging
 
+from aiosqlite import connect as aiosqlite_connect
+
 from app.core.ids import generate_id
 from app.memory.judge import MemoryJudgeConfigView, judge_memories_with_llm
 from app.memory.review_policy import auto_review, determine_risk_level
 from app.storage.sqlite_cards import (
-    find_card_id_by_content,
+    find_duplicate_card,
     insert_card,
     insert_card_version,
     insert_inbox_item,
@@ -19,6 +21,95 @@ from app.storage.sqlite_cards import (
 from app.storage.vector_sync import enqueue_card_vector_sync, sync_card_vector
 
 logger = logging.getLogger("kokoromemo.card_extractor")
+
+# Card types that represent volatile task progress — route as pending to avoid
+# long-term memory pollution from rapidly-changing task state.
+_TASK_STATE_TYPES = frozenset({"task_state", "task_progress", "quest_progress"})
+
+
+def default_card_title(content: str, card_type: str, max_len: int = 80) -> str:
+    """Generate a fallback card title when the LLM doesn't provide one.
+
+    Uses the first sentence or first max_len chars of content, with
+    the card_type as a prefix if the content is very short.
+    """
+    text = content.strip()
+    if not text:
+        return card_type
+
+    for sep in ("。", "！", "？", ".", "!", "?", "\n"):
+        idx = text.find(sep)
+        if idx > 0:
+            return text[:idx + 1].strip()[:max_len]
+
+    if len(text) > max_len:
+        return text[:max_len - 1] + "…"
+    return text
+
+
+async def enrich_existing_card_from_duplicate_candidate(
+    db_path: str,
+    existing_card: dict,
+    new_importance: float,
+    new_confidence: float,
+    new_turn_id: str | None,
+) -> None:
+    """Update an existing card with enriched fields from a duplicate candidate.
+
+    Merge rules:
+    - importance: max(existing, new)
+    - confidence: max(existing, new)
+    - source_turn_ids: union of existing and new turn id
+
+    Writes a card_version for audit trail.
+    """
+    import json as _json
+
+    new_imp = max(existing_card.get("importance", 0.0), new_importance)
+    new_conf = max(existing_card.get("confidence", 0.0), new_confidence)
+
+    turn_ids: set[str] = set()
+    existing_turns = existing_card.get("source_turn_ids_json")
+    if existing_turns:
+        try:
+            parsed = _json.loads(existing_turns)
+            if isinstance(parsed, list):
+                turn_ids.update(str(t) for t in parsed)
+        except (_json.JSONDecodeError, TypeError):
+            pass
+    if new_turn_id:
+        turn_ids.add(new_turn_id)
+    merged_turns = _json.dumps(sorted(turn_ids), ensure_ascii=False, separators=(",", ":")) if turn_ids else None
+
+    card_id = existing_card["card_id"]
+    async with aiosqlite_connect(db_path, timeout=10.0) as db:
+        await db.execute(
+            """UPDATE memory_cards
+               SET importance = ?, confidence = ?, source_turn_ids_json = ?,
+                   updated_at = datetime('now', 'localtime')
+               WHERE card_id = ?""",
+            (new_imp, new_conf, merged_turns, card_id),
+        )
+        await db.commit()
+
+    await insert_card_version(
+        db_path,
+        card_id=card_id,
+        content=existing_card.get("content", ""),
+        card_type=existing_card.get("card_type", "preference"),
+        importance=new_imp,
+        confidence=new_conf,
+    )
+
+    logger.info(
+        "memory_extract route=enriched_existing card_id=%s old_imp=%.2f new_imp=%.2f old_conf=%.2f new_conf=%.2f turn_ids=%d",
+        card_id,
+        existing_card.get("importance", 0.0),
+        new_imp,
+        existing_card.get("confidence", 0.0),
+        new_conf,
+        len(turn_ids),
+    )
 
 
 async def extract_and_route(
@@ -35,17 +126,22 @@ async def extract_and_route(
     judge_config: MemoryJudgeConfigView | None = None,
     lang: str = "zh",
     discarded_keep_limit: int = 200,
+    turn_id: str | None = None,
 ) -> None:
     """Extract candidate memory cards and route through review policy.
 
     Flow:
     1. Memory judge model → candidate cards
-    2. review_policy.auto_review() for each
-    3. auto_approve → write card(approved) + embed + LanceDB
-    4. pending → write inbox item
-    5. reject / dedup → write inbox item with status='discarded' + discard_reason
+    2. Scoped dedup check (library/user/character/scope/type)
+    3. If duplicate found → enrich existing card (max fields, union turn_ids)
+    4. task_state types → always route to pending (volatile, not long-term)
+    5. review_policy.auto_review() for remaining
+    6. auto_approve → write card(approved) + embed + LanceDB
+    7. pending → write inbox item
+    8. reject / semantic dup → write inbox item with status='discarded'
     """
     if not judge_config:
+        logger.info("memory_extract skipped reason=no_judge_config conv=%s", conversation_id)
         return
 
     try:
@@ -63,13 +159,17 @@ async def extract_and_route(
         return
 
     if not extracted:
+        logger.info("memory_extract no_candidates conv=%s", conversation_id)
         return
 
     library_id = await get_write_library_id(db_path, conversation_id)
     discarded_written = False
+    source_turns = json.dumps([turn_id], ensure_ascii=False, separators=(",", ":")) if turn_id else None
+    logger.info("memory_extract candidates=%d conv=%s library_id=%s turn_id=%s", len(extracted), conversation_id, library_id, turn_id)
 
     for mem in extracted:
         risk_level = _risk_level_from_tags(mem.tags) or determine_risk_level(mem.memory_type, mem.confidence)
+        title = mem.title or default_card_title(mem.content, mem.memory_type)
         card_payload = {
             "library_id": library_id,
             "user_id": user_id,
@@ -77,6 +177,7 @@ async def extract_and_route(
             "conversation_id": conversation_id,
             "scope": mem.scope,
             "card_type": mem.memory_type,
+            "title": title,
             "content": mem.content,
             "importance": mem.importance,
             "confidence": mem.confidence,
@@ -84,29 +185,42 @@ async def extract_and_route(
             "evidence_text": user_message[:300],
         }
 
-        # 去重：精确文本匹配 → 写入 discarded
-        related_card_id = await find_card_id_by_content(db_path, user_id, mem.content)
-        if related_card_id:
-            await _write_discarded(
+        # Scoped dedup: check for existing card in same bucket with similar content
+        from app.memory.dedup import normalize_card_content
+        dup_card = await find_duplicate_card(
+            db_path,
+            library_id=library_id,
+            user_id=user_id,
+            character_id=character_id,
+            scope=mem.scope,
+            card_type=mem.memory_type,
+            content=mem.content,
+            normalized_content=normalize_card_content(mem.content),
+        )
+        if dup_card:
+            await enrich_existing_card_from_duplicate_candidate(
                 db_path,
-                card_payload=card_payload,
-                user_id=user_id,
-                character_id=character_id,
-                conversation_id=conversation_id,
-                risk_level=risk_level,
-                library_id=library_id,
-                discard_reason="exact_duplicate",
-                reason="与已有卡片内容完全相同",
-                related_card_id=related_card_id,
+                existing_card=dup_card,
+                new_importance=mem.importance,
+                new_confidence=mem.confidence,
+                new_turn_id=turn_id,
             )
-            discarded_written = True
-            logger.debug("Discarded duplicate card: %s", mem.content[:50])
+            logger.debug("Enriched existing card %s from duplicate candidate", dup_card["card_id"])
             continue
 
-        # 语义去重：通过向量相似度
+        # Semantic dedup via vector similarity
         if embedding_provider and lancedb_store:
             sem_match = await _find_semantic_duplicate(embedding_provider, lancedb_store, user_id, mem.content)
             if sem_match:
+                logger.info(
+                    "memory_extract route=discarded_semantic_duplicate conv=%s type=%s importance=%.2f confidence=%.2f related_card_id=%s similarity=%.2f",
+                    conversation_id,
+                    mem.memory_type,
+                    mem.importance,
+                    mem.confidence,
+                    sem_match[0],
+                    sem_match[1],
+                )
                 await _write_discarded(
                     db_path,
                     card_payload=card_payload,
@@ -123,16 +237,30 @@ async def extract_and_route(
                 logger.debug("Discarded semantic near-duplicate: %s", mem.content[:50])
                 continue
 
-        decision = auto_review(
-            card_type=mem.memory_type,
-            importance=mem.importance,
-            confidence=mem.confidence,
-            risk_level=risk_level,
-            tags=mem.tags,
+        # Volatile task_state routing: always pending to avoid long-term clutter
+        if mem.memory_type in _TASK_STATE_TYPES:
+            decision = "pending"
+        else:
+            decision = auto_review(
+                card_type=mem.memory_type,
+                importance=mem.importance,
+                confidence=mem.confidence,
+                risk_level=risk_level,
+                tags=mem.tags,
+            )
+        logger.info(
+            "memory_extract decision=%s conv=%s type=%s importance=%.2f confidence=%.2f risk=%s tags=%s content=%s",
+            decision,
+            conversation_id,
+            mem.memory_type,
+            mem.importance,
+            mem.confidence,
+            risk_level,
+            ",".join(mem.tags),
+            mem.content[:80],
         )
 
         if decision == "approve":
-            # 直接批准：写入 memory_cards 并同步向量
             card_id = generate_id("card_")
             await insert_card(
                 db_path,
@@ -143,11 +271,13 @@ async def extract_and_route(
                 conversation_id=conversation_id,
                 scope=mem.scope,
                 card_type=mem.memory_type,
+                title=title,
                 content=mem.content,
                 importance=mem.importance,
                 confidence=mem.confidence,
                 status="approved",
                 evidence_text=user_message[:300],
+                source_turn_ids_json=source_turns,
             )
             await insert_card_version(
                 db_path,
@@ -158,7 +288,6 @@ async def extract_and_route(
                 confidence=mem.confidence,
             )
 
-            # 向量同步
             if embedding_provider and lancedb_store:
                 try:
                     await sync_card_vector(db_path, card_id, embedding_provider, lancedb_store)
@@ -171,7 +300,6 @@ async def extract_and_route(
                 logger.info("Auto-approved card (no vector): %s", card_id)
 
         elif decision == "pending":
-            # 写入待审核列表供用户复核
             inbox_id = generate_id("inbox_")
             await insert_inbox_item(
                 db_path,
@@ -191,7 +319,6 @@ async def extract_and_route(
             await _emit_card_event("inbox_new", inbox_id, mem)
 
         else:
-            # 被自动审核策略拒绝：写入 discarded 供查阅与恢复
             await _write_discarded(
                 db_path,
                 card_payload=card_payload,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from app.core.json_utils import parse_json_object
@@ -13,6 +14,8 @@ from app.core.prompts import (
 )
 from app.proxy.llm_providers import create_llm_provider
 
+logger = logging.getLogger("kokoromemo.memory.judge")
+
 
 @dataclass
 class ExtractedMemory:
@@ -22,6 +25,7 @@ class ExtractedMemory:
     importance: float
     confidence: float
     tags: list[str]
+    title: str | None = None  # parsed from LLM output, or None for fallback
 
 
 @dataclass
@@ -71,17 +75,33 @@ async def judge_memories_with_llm(
     )
     content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
     payload = parse_json_object(content, fallback={"memories": []})
+    raw_items = payload.get("memories") or payload.get("items") or []
+    logger.info(
+        "memory_judge model=%s raw_candidates=%d user_chars=%d assistant_chars=%d",
+        config.model,
+        len(raw_items) if isinstance(raw_items, list) else 0,
+        len(user_message),
+        len(assistant_message),
+    )
     memories: list[ExtractedMemory] = []
-    for item in payload.get("memories") or payload.get("items") or []:
+    for item in raw_items:
         if not isinstance(item, dict):
             continue
         if item.get("should_remember") is False:
+            logger.info("memory_judge skipped reason=should_remember_false item=%s", item)
             continue
         memory_type = normalize_memory_type(item.get("memory_type") or item.get("card_type") or "preference")
         memory_content = item.get("content") or item.get("memory") or ""
         importance = float(item.get("importance", 0.5))
         confidence = float(item.get("confidence", 0.6))
         if not memory_content or importance < min_importance or confidence < min_confidence:
+            logger.info(
+                "memory_judge filtered type=%s importance=%.2f confidence=%.2f content_chars=%d",
+                memory_type,
+                importance,
+                confidence,
+                len(memory_content),
+            )
             continue
         tags = item.get("tags") or [memory_type]
         if not isinstance(tags, list):
@@ -92,6 +112,7 @@ async def judge_memories_with_llm(
         risk_level = item.get("risk_level")
         if risk_level:
             tags.append(f"risk:{risk_level}")
+        title = item.get("title") or item.get("summary") or None
         memories.append(ExtractedMemory(
             scope=item.get("scope") or ("character" if character_id else "global"),
             memory_type=memory_type,
@@ -99,7 +120,9 @@ async def judge_memories_with_llm(
             importance=importance,
             confidence=confidence,
             tags=[str(tag) for tag in tags],
+            title=title[:200] if title else None,
         ))
+    logger.info("memory_judge accepted_candidates=%d", len(memories))
     return memories
 
 
@@ -125,6 +148,7 @@ def normalize_memory_type(memory_type: str) -> str:
         "speech_style": "preference",
         "speaking_style": "preference",
         "speech_habit": "preference",
+        "user_preference": "preference",
         "口癖": "preference",
         "roleplay_rule": "preference",
         "persona_rule": "preference",

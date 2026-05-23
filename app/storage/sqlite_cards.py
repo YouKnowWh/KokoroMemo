@@ -347,6 +347,52 @@ async def find_card_id_by_content(db_path: str, user_id: str, content: str) -> s
         return row[0] if row else None
 
 
+async def find_duplicate_card(
+    db_path: str,
+    *,
+    library_id: str,
+    user_id: str,
+    character_id: str | None,
+    scope: str,
+    card_type: str,
+    content: str,
+    normalized_content: str | None = None,
+) -> dict | None:
+    """Find an existing approved card that matches by scope bucket and content.
+
+    Scoped dedup: matches must share library_id, user_id, character_id, scope.
+    Checks both exact content match and (when provided) normalized content match.
+
+    Returns the matching card dict, or None if no duplicate found.
+    """
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM memory_cards
+               WHERE library_id = ?
+                 AND user_id = ?
+                 AND (character_id = ? OR (character_id IS NULL AND ? IS NULL))
+                 AND scope = ?
+                 AND card_type = ?
+                 AND status = 'approved'
+               LIMIT 1""",
+            (library_id, user_id, character_id, character_id, scope, card_type),
+        )
+        row = await cursor.fetchone()
+        if row:
+            card = dict(row)
+            # Exact content match
+            if card.get("content") == content:
+                return card
+            # Normalized content match
+            if normalized_content:
+                from app.memory.dedup import normalize_card_content
+                existing_norm = normalize_card_content(card.get("content", ""))
+                if existing_norm == normalized_content:
+                    return card
+        return None
+
+
 async def list_cards_for_dedup(
     db_path: str,
     user_id: str | None = None,
@@ -614,6 +660,7 @@ async def insert_card(
     is_pinned: int = 0,
     evidence_text: str | None = None,
     supersedes_card_id: str | None = None,
+    source_turn_ids_json: str | None = None,
     library_id: str | None = None,
 ) -> None:
     library_id = library_id or DEFAULT_MEMORY_LIBRARY_ID
@@ -622,11 +669,11 @@ async def insert_card(
             """INSERT OR IGNORE INTO memory_cards
                (card_id, library_id, user_id, character_id, conversation_id, scope, card_type,
                 title, content, summary, importance, confidence, status, is_pinned,
-                evidence_text, supersedes_card_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                evidence_text, supersedes_card_id, source_turn_ids_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (card_id, library_id, user_id, character_id, conversation_id, scope, card_type,
              title, content, summary, importance, confidence, status, is_pinned,
-             evidence_text, supersedes_card_id),
+             evidence_text, supersedes_card_id, source_turn_ids_json),
         )
         await db.commit()
 
