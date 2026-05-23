@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS memory_libraries (
   library_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT,
+  db_path TEXT,
   status TEXT NOT NULL DEFAULT 'active',
   is_builtin INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
@@ -216,6 +217,9 @@ CREATE TABLE IF NOT EXISTS memory_mount_presets (
 
 _MEMORY_CARD_COLUMNS = {
     "library_id": "TEXT NOT NULL DEFAULT 'lib_default'",
+    "merged_into_card_id": "TEXT",
+    "merge_reason": "TEXT",
+    "deleted_at": "TEXT",
 }
 
 _MEMORY_INBOX_COLUMNS = {
@@ -232,7 +236,7 @@ _MEMORY_SUMMARY_COLUMNS = {
 async def init_cards_db(db_path: str) -> None:
     """Initialize the cards database with all tables."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.executescript(_CARDS_SCHEMA)
         await _ensure_columns(db, "memory_cards", _MEMORY_CARD_COLUMNS)
         await _ensure_columns(db, "memory_inbox", _MEMORY_INBOX_COLUMNS)
@@ -245,7 +249,7 @@ async def init_cards_db(db_path: str) -> None:
 async def delete_conversation_memory_data(db_path: str, conversation_id: str) -> dict[str, int]:
     """删除指定会话关联的长期记忆、候选、摘要和挂载关系。"""
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         card_cursor = await db.execute(
             "SELECT card_id FROM memory_cards WHERE conversation_id = ?",
             (conversation_id,),
@@ -324,7 +328,7 @@ async def _ensure_default_library(db: aiosqlite.Connection) -> None:
 
 async def card_exists_with_content(db_path: str, user_id: str, content: str) -> bool:
     """Check if a card with identical content already exists (dedup)."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             "SELECT 1 FROM memory_cards WHERE user_id = ? AND content = ? AND status != 'deleted' LIMIT 1",
             (user_id, content),
@@ -334,7 +338,7 @@ async def card_exists_with_content(db_path: str, user_id: str, content: str) -> 
 
 async def find_card_id_by_content(db_path: str, user_id: str, content: str) -> str | None:
     """Return existing card_id for a duplicate content match, or None."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             "SELECT card_id FROM memory_cards WHERE user_id = ? AND content = ? AND status != 'deleted' LIMIT 1",
             (user_id, content),
@@ -343,12 +347,102 @@ async def find_card_id_by_content(db_path: str, user_id: str, content: str) -> s
         return row[0] if row else None
 
 
+async def list_cards_for_dedup(
+    db_path: str,
+    user_id: str | None = None,
+    character_id: str | None = None,
+    scope: str | None = None,
+    card_type: str | None = None,
+    status: str = "approved",
+    limit: int = 500,
+) -> list[dict]:
+    """List cards grouped for dedup scanning.
+
+    Returns cards matching the filters, ordered by content hash for
+    efficient duplicate group detection.
+    """
+    clauses = ["status = ?"]
+    params: list = [status]
+    if user_id:
+        clauses.append("user_id = ?")
+        params.append(user_id)
+    if character_id:
+        clauses.append("character_id = ?")
+        params.append(character_id)
+    if scope:
+        clauses.append("scope = ?")
+        params.append(scope)
+    if card_type:
+        clauses.append("card_type = ?")
+        params.append(card_type)
+    where = " AND ".join(clauses)
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"SELECT * FROM memory_cards WHERE {where} ORDER BY user_id, character_id, scope, content LIMIT ?",
+            (*params, limit),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def find_exact_duplicate_groups(
+    db_path: str,
+    user_id: str | None = None,
+    character_id: str | None = None,
+    scope: str | None = None,
+    min_group_size: int = 2,
+) -> list[list[dict]]:
+    """Find groups of cards sharing identical content within the same scope.
+
+    Returns a list of groups, where each group is a list of card dicts
+    that have identical content. Groups are ordered by size descending.
+    """
+    cards = await list_cards_for_dedup(
+        db_path,
+        user_id=user_id,
+        character_id=character_id,
+        scope=scope,
+    )
+    if not cards:
+        return []
+
+    content_map: dict[str, list[dict]] = {}
+    for card in cards:
+        key = (card.get("user_id", ""), card.get("character_id") or "", card.get("scope", ""), card.get("content", ""))
+        content_map.setdefault(key, []).append(card)
+
+    groups = [g for g in content_map.values() if len(g) >= min_group_size]
+    groups.sort(key=len, reverse=True)
+    return groups
+
+
+async def insert_card_event(
+    db_path: str,
+    card_id: str,
+    event_type: str,
+    payload: dict | None = None,
+) -> str:
+    """Insert an event into memory_card_events for audit history."""
+    from app.core.ids import generate_id as _gen_id
+
+    event_id = _gen_id("evt_")
+    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
+        await db.execute(
+            """INSERT INTO memory_card_events (event_id, card_id, event_type, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            (event_id, card_id, event_type, payload_json),
+        )
+        await db.commit()
+    return event_id
+
+
 # --- 记忆库与挂载 ---
 
 async def list_memory_libraries(db_path: str, include_deleted: bool = False) -> list[dict]:
     await init_cards_db(db_path)
     where = "" if include_deleted else "WHERE l.status = 'active'"
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT l.*, COUNT(c.card_id) AS card_count
@@ -370,7 +464,7 @@ async def create_memory_library(
 ) -> str:
     await init_cards_db(db_path)
     library_id = library_id or generate_id("lib_")
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT INTO memory_libraries (library_id, name, description, status, is_builtin)
                VALUES (?, ?, ?, 'active', 0)
@@ -403,7 +497,7 @@ async def create_memory_library(
 
 async def update_memory_library(db_path: str, library_id: str, name: str, description: str = "") -> bool:
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             """UPDATE memory_libraries
                SET name = ?, description = ?, updated_at = datetime('now', 'localtime')
@@ -418,7 +512,7 @@ async def delete_memory_library(db_path: str, library_id: str) -> bool:
     if library_id == DEFAULT_MEMORY_LIBRARY_ID:
         return False
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             """UPDATE memory_libraries
                SET status = 'deleted', updated_at = datetime('now', 'localtime')
@@ -435,7 +529,7 @@ async def delete_memory_library(db_path: str, library_id: str) -> bool:
 
 async def get_conversation_mounts(db_path: str, conversation_id: str) -> list[dict]:
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT m.*, l.name, l.description, l.is_builtin
@@ -478,7 +572,7 @@ async def set_conversation_mounts(
     if not library_ids:
         library_ids = [DEFAULT_MEMORY_LIBRARY_ID]
     write_library_id = write_library_id if write_library_id in library_ids else library_ids[0]
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "UPDATE conversation_memory_mounts SET status = 'deleted', updated_at = datetime('now', 'localtime') WHERE conversation_id = ?",
             (conversation_id,),
@@ -523,7 +617,7 @@ async def insert_card(
     library_id: str | None = None,
 ) -> None:
     library_id = library_id or DEFAULT_MEMORY_LIBRARY_ID
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT OR IGNORE INTO memory_cards
                (card_id, library_id, user_id, character_id, conversation_id, scope, card_type,
@@ -546,7 +640,7 @@ async def insert_card_version(
     importance: float = 0.5,
     confidence: float = 0.7,
 ) -> str:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             "SELECT COALESCE(MAX(version_number), 0) + 1 FROM memory_card_versions WHERE card_id = ?",
             (card_id,),
@@ -572,7 +666,7 @@ async def insert_review_action(
     note: str | None = None,
 ) -> str:
     action_id = generate_id("review_")
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT INTO review_actions
                (action_id, inbox_id, card_id, action, reviewer, note)
@@ -585,7 +679,7 @@ async def insert_review_action(
 
 async def enqueue_job(db_path: str, job_type: str, payload_json: str, last_error: str | None = None) -> str:
     job_id = generate_id("job_")
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT INTO jobs (job_id, job_type, status, payload_json, last_error)
                VALUES (?, ?, 'pending', ?, ?)""",
@@ -596,7 +690,7 @@ async def enqueue_job(db_path: str, job_type: str, payload_json: str, last_error
 
 
 async def get_pending_jobs(db_path: str, job_type: str | None = None, limit: int = 50) -> list[dict]:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         if job_type:
             cursor = await db.execute(
@@ -614,7 +708,7 @@ async def get_pending_jobs(db_path: str, job_type: str | None = None, limit: int
 
 
 async def update_job_status(db_path: str, job_id: str, status: str, last_error: str | None = None) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """UPDATE jobs SET status = ?, last_error = ?,
                attempts = attempts + CASE WHEN ? = 'failed' THEN 1 ELSE 0 END,
@@ -625,7 +719,7 @@ async def update_job_status(db_path: str, job_id: str, status: str, last_error: 
 
 
 async def update_card_status(db_path: str, card_id: str, status: str) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "UPDATE memory_cards SET status = ?, updated_at = datetime('now', 'localtime') WHERE card_id = ?",
             (status, card_id),
@@ -634,7 +728,7 @@ async def update_card_status(db_path: str, card_id: str, status: str) -> None:
 
 
 async def mark_card_vector_synced(db_path: str, card_id: str, model: str, dimension: int | None) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """UPDATE memory_cards SET vector_synced = 1, vector_synced_at = datetime('now', 'localtime'),
                embedding_model = ?, embedding_dimension = ? WHERE card_id = ?""",
@@ -644,7 +738,7 @@ async def mark_card_vector_synced(db_path: str, card_id: str, model: str, dimens
 
 
 async def mark_card_vector_unsynced(db_path: str, card_id: str) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """UPDATE memory_cards SET vector_synced = 0, vector_synced_at = NULL,
                updated_at = datetime('now', 'localtime') WHERE card_id = ?""",
@@ -658,7 +752,7 @@ async def get_cards_by_ids(db_path: str, card_ids: list[str]) -> dict[str, dict]
     if not card_ids:
         return {}
     placeholders = ",".join(["?"] * len(card_ids))
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"SELECT * FROM memory_cards WHERE card_id IN ({placeholders})",
@@ -670,7 +764,7 @@ async def get_cards_by_ids(db_path: str, card_ids: list[str]) -> dict[str, dict]
 
 async def get_approved_cards(db_path: str, user_id: str | None = None) -> list[dict]:
     """Get all approved cards, optionally filtered by user."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         if user_id:
             cursor = await db.execute(
@@ -690,7 +784,7 @@ async def get_pinned_cards(
 ) -> list[dict]:
     """Get pinned/boundary cards for retrieval."""
     library_ids = library_ids or [DEFAULT_MEMORY_LIBRARY_ID]
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         placeholders = ",".join("?" for _ in library_ids)
         query = """SELECT * FROM memory_cards
@@ -717,7 +811,7 @@ async def get_recent_important_cards(
 ) -> list[dict]:
     """Get recently created important approved cards."""
     library_ids = library_ids or [DEFAULT_MEMORY_LIBRARY_ID]
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         placeholders = ",".join("?" for _ in library_ids)
         query = """SELECT * FROM memory_cards
@@ -755,7 +849,7 @@ async def insert_inbox_item(
     related_card_id: str | None = None,
 ) -> None:
     library_id = library_id or DEFAULT_MEMORY_LIBRARY_ID
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT INTO memory_inbox
                (inbox_id, library_id, candidate_type, payload_json, user_id, character_id, conversation_id,
@@ -771,7 +865,7 @@ async def trim_discarded_inbox(db_path: str, keep_limit: int) -> int:
     """保留最近 keep_limit 条 status='discarded' 的条目，删除更早的。返回删除条数。"""
     if keep_limit <= 0:
         return 0
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             """DELETE FROM memory_inbox
                WHERE inbox_id IN (
@@ -787,7 +881,7 @@ async def trim_discarded_inbox(db_path: str, keep_limit: int) -> int:
 
 
 async def get_inbox_items(db_path: str, status: str = "pending", limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         count_cursor = await db.execute(
             "SELECT COUNT(*) FROM memory_inbox WHERE status = ?", (status,)
@@ -805,7 +899,7 @@ async def get_inbox_items_multi(db_path: str, statuses: list[str], limit: int = 
     if not statuses:
         return [], 0
     placeholders = ",".join("?" for _ in statuses)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         count_cursor = await db.execute(
             f"SELECT COUNT(*) FROM memory_inbox WHERE status IN ({placeholders})",
@@ -821,7 +915,7 @@ async def get_inbox_items_multi(db_path: str, statuses: list[str], limit: int = 
 
 
 async def update_inbox_status(db_path: str, inbox_id: str, status: str, review_note: str | None = None) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "UPDATE memory_inbox SET status = ?, reviewed_at = datetime('now', 'localtime'), review_note = ? WHERE inbox_id = ?",
             (status, review_note, inbox_id),
@@ -837,7 +931,7 @@ async def transition_inbox_status(
     review_note: str | None = None,
 ) -> bool:
     """Atomically move an inbox item between statuses if it is still in from_status."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             """UPDATE memory_inbox
                SET status = ?, reviewed_at = datetime('now', 'localtime'), review_note = ?
@@ -849,7 +943,7 @@ async def transition_inbox_status(
 
 
 async def get_inbox_item(db_path: str, inbox_id: str) -> dict | None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM memory_inbox WHERE inbox_id = ?", (inbox_id,))
         row = await cursor.fetchone()
@@ -878,7 +972,7 @@ async def list_memory_diagnostics(
         inbox_where.append("conversation_id = ?")
         params.append(conversation_id)
         inbox_params.append(conversation_id)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         card_cursor = await db.execute(
             f"""SELECT card_id, library_id, user_id, character_id, conversation_id, scope, card_type,
@@ -909,7 +1003,7 @@ async def list_memory_diagnostics(
 async def copy_conversation_mounts(db_path: str, source_conversation_id: str, target_conversation_id: str) -> int:
     """Copy memory mount configuration from one conversation to another. Returns count copied."""
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT * FROM conversation_memory_mounts
@@ -947,7 +1041,7 @@ async def copy_conversation_mounts(db_path: str, source_conversation_id: str, ta
 async def update_conversation_character_refs(db_path: str, conversation_id: str, character_id: str | None) -> dict[str, int]:
     """更新单个会话在记忆相关表中的角色引用。"""
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         mounts = await db.execute(
             "UPDATE conversation_memory_mounts SET character_id = ?, updated_at = datetime('now', 'localtime') WHERE conversation_id = ?",
             (character_id, conversation_id),
@@ -967,7 +1061,7 @@ async def update_conversation_character_refs(db_path: str, conversation_id: str,
 async def merge_character_refs(db_path: str, source_character_id: str, target_character_id: str) -> dict[str, int]:
     """将记忆相关表中的源角色引用迁移到目标角色。"""
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         mounts = await db.execute(
             "UPDATE conversation_memory_mounts SET character_id = ?, updated_at = datetime('now', 'localtime') WHERE character_id = ?",
             (target_character_id, source_character_id),
@@ -989,7 +1083,7 @@ async def merge_character_refs(db_path: str, source_character_id: str, target_ch
 async def list_mount_presets(db_path: str, include_deleted: bool = False) -> list[dict]:
     await init_cards_db(db_path)
     where = "" if include_deleted else "WHERE status = 'active'"
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"SELECT * FROM memory_mount_presets {where} ORDER BY updated_at DESC"
@@ -999,7 +1093,7 @@ async def list_mount_presets(db_path: str, include_deleted: bool = False) -> lis
 
 async def get_mount_preset(db_path: str, preset_id: str) -> dict | None:
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM memory_mount_presets WHERE preset_id = ?", (preset_id,)
@@ -1019,7 +1113,7 @@ async def create_mount_preset(
     await init_cards_db(db_path)
     preset_id = preset_id or generate_id("preset_")
     library_ids_json = json.dumps(library_ids, ensure_ascii=False)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT INTO memory_mount_presets
                (preset_id, name, description, library_ids_json, write_library_id, status)
@@ -1064,7 +1158,7 @@ async def update_mount_preset(
         return False
     fields.append("updated_at = datetime('now', 'localtime')")
     params.append(preset_id)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             f"UPDATE memory_mount_presets SET {', '.join(fields)} WHERE preset_id = ?",
             params,
@@ -1075,7 +1169,7 @@ async def update_mount_preset(
 
 async def delete_mount_preset(db_path: str, preset_id: str) -> bool:
     await init_cards_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             """UPDATE memory_mount_presets
                SET status = 'deleted', updated_at = datetime('now', 'localtime')
@@ -1084,3 +1178,167 @@ async def delete_mount_preset(db_path: str, preset_id: str) -> bool:
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+# --- 记忆卡片合并 ---
+
+
+async def merge_memory_cards(
+    db_path: str,
+    survivor_card_id: str,
+    superseded_card_ids: list[str],
+    merge_reason: str = "manual",
+    dry_run: bool = False,
+) -> dict:
+    """Merge superseded cards into a survivor card.
+
+    Merge rules (applied from app.memory.dedup):
+    - importance / confidence / stability: max across all cards
+    - source_turn_ids_json: union of all source turn ids
+    - evidence_text: concatenated (max 1000 chars)
+    - access_count: summed
+
+    Superseded cards are soft-deleted with merged_into_card_id, merge_reason,
+    and deleted_at set.
+
+    When dry_run=True, returns a MergePreview-style dict without modifying the DB.
+
+    Returns a dict with keys:
+      survivor_card_id, superseded_count, merged_fields (or 'preview' for dry_run),
+      versions_created, events_created
+    """
+    from app.memory.dedup import merge_field_rules, _changes_summary
+
+    await init_cards_db(db_path)
+
+    all_ids = [survivor_card_id] + superseded_card_ids
+    cards_by_id = await get_cards_by_ids(db_path, all_ids)
+
+    survivor = cards_by_id.get(survivor_card_id)
+    if not survivor:
+        raise ValueError(f"Survivor card not found: {survivor_card_id}")
+
+    superseded = []
+    for cid in superseded_card_ids:
+        card = cards_by_id.get(cid)
+        if not card:
+            raise ValueError(f"Superseded card not found: {cid}")
+        if card.get("status") == "deleted":
+            raise ValueError(f"Superseded card already deleted: {cid}")
+        superseded.append(card)
+
+    merged = merge_field_rules(survivor, superseded)
+    changes = _changes_summary(survivor, merged)
+    changed_fields = {k: v for k, v in merged.items()
+                      if k in ("importance", "confidence", "stability",
+                               "source_turn_ids_json", "evidence_text", "access_count")
+                      and k in changes}
+
+    if dry_run:
+        superseded_previews = []
+        for card in superseded:
+            superseded_previews.append({
+                "card_id": card["card_id"],
+                "content": card["content"][:80],
+                "merged_into_card_id": survivor_card_id,
+                "merge_reason": merge_reason,
+            })
+        return {
+            "dry_run": True,
+            "survivor_card_id": survivor_card_id,
+            "superseded_card_ids": [c["card_id"] for c in superseded],
+            "merged_card": {
+                k: merged.get(k) for k in ("importance", "confidence", "stability",
+                                            "source_turn_ids_json", "evidence_text", "access_count")
+            },
+            "changes": {k: list(v) for k, v in changes.items()
+                        if k in ("importance", "confidence", "stability",
+                                 "source_turn_ids_json", "evidence_text", "access_count")},
+            "superseded_updates": superseded_previews,
+        }
+
+    # Execute merge transaction
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
+        # Update survivor with merged fields
+        now = "datetime('now', 'localtime')"
+        await db.execute(
+            f"""UPDATE memory_cards SET
+                importance = ?, confidence = ?, stability = ?,
+                source_turn_ids_json = ?, evidence_text = ?, access_count = ?,
+                updated_at = {now}
+                WHERE card_id = ?""",
+            (
+                merged.get("importance", 0.5),
+                merged.get("confidence", 0.7),
+                merged.get("stability", 0.5),
+                merged.get("source_turn_ids_json"),
+                merged.get("evidence_text"),
+                merged.get("access_count", 0),
+                survivor_card_id,
+            ),
+        )
+
+        # Soft-delete superseded cards
+        for card in superseded:
+            await db.execute(
+                f"""UPDATE memory_cards SET
+                    status = 'deleted',
+                    merged_into_card_id = ?,
+                    merge_reason = ?,
+                    deleted_at = {now},
+                    updated_at = {now}
+                    WHERE card_id = ?""",
+                (survivor_card_id, merge_reason, card["card_id"]),
+            )
+
+        await db.commit()
+
+    # Audit history (outside the transaction connection — each is atomic)
+    version_id = await insert_card_version(
+        db_path,
+        card_id=survivor_card_id,
+        content=survivor.get("content", ""),
+        card_type=survivor.get("card_type", "preference"),
+        summary=survivor.get("summary"),
+        importance=survivor.get("importance", 0.5),
+        confidence=survivor.get("confidence", 0.7),
+    )
+
+    await insert_review_action(
+        db_path,
+        action="merge",
+        card_id=survivor_card_id,
+        reviewer="system",
+        note=f"Merged {len(superseded)} card(s) into survivor. Reason: {merge_reason}",
+    )
+
+    await insert_card_event(
+        db_path,
+        survivor_card_id,
+        "card_merged_into",
+        {
+            "superseded_card_ids": [c["card_id"] for c in superseded],
+            "merge_reason": merge_reason,
+            "merged_fields": changed_fields,
+        },
+    )
+
+    for card in superseded:
+        await insert_card_event(
+            db_path,
+            card["card_id"],
+            "card_merged_out",
+            {
+                "merged_into_card_id": survivor_card_id,
+                "merge_reason": merge_reason,
+            },
+        )
+
+    return {
+        "dry_run": False,
+        "survivor_card_id": survivor_card_id,
+        "superseded_count": len(superseded),
+        "merged_fields": changed_fields,
+        "versions_created": 1,
+        "events_created": 1 + len(superseded),
+    }
