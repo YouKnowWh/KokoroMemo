@@ -374,12 +374,11 @@ async def find_duplicate_card(
                  AND (character_id = ? OR (character_id IS NULL AND ? IS NULL))
                  AND scope = ?
                  AND card_type = ?
-                 AND status = 'approved'
-               LIMIT 1""",
+                 AND status = 'approved'""",
             (library_id, user_id, character_id, character_id, scope, card_type),
         )
-        row = await cursor.fetchone()
-        if row:
+        rows = await cursor.fetchall()
+        for row in rows:
             card = dict(row)
             # Exact content match
             if card.get("content") == content:
@@ -454,7 +453,14 @@ async def find_exact_duplicate_groups(
 
     content_map: dict[str, list[dict]] = {}
     for card in cards:
-        key = (card.get("user_id", ""), card.get("character_id") or "", card.get("scope", ""), card.get("content", ""))
+        key = (
+                    card.get("library_id", ""),
+                    card.get("user_id", ""),
+                    card.get("character_id") or "",
+                    card.get("scope", ""),
+                    card.get("card_type", ""),
+                    card.get("content", ""),
+                )
         content_map.setdefault(key, []).append(card)
 
     groups = [g for g in content_map.values() if len(g) >= min_group_size]
@@ -1257,6 +1263,14 @@ async def merge_memory_cards(
     from app.memory.dedup import merge_field_rules, _changes_summary
 
     await init_cards_db(db_path)
+
+    # Reject self-referencing and duplicate superseded IDs
+    deduped_superseded = list(dict.fromkeys(superseded_card_ids))
+    if survivor_card_id in deduped_superseded:
+        raise ValueError(
+            f"Survivor card {survivor_card_id} cannot also appear in superseded_card_ids"
+        )
+    superseded_card_ids = deduped_superseded
 
     all_ids = [survivor_card_id] + superseded_card_ids
     cards_by_id = await get_cards_by_ids(db_path, all_ids)

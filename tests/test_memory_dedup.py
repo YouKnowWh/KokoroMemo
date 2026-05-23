@@ -479,6 +479,245 @@ async def test_merge_memory_cards_multiple_superseded():
 
 
 # ---------------------------------------------------------------------------
+# Fix 1: find_duplicate_card scans all bucket candidates (not just the first)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_scans_all_bucket_candidates_not_just_first():
+    """When the first row in a bucket has different content, the function
+    must keep scanning and find a later row that matches."""
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_first", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Completely different content", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+        await insert_card(
+            db_path, card_id="card_second", user_id="u1", character_id="ch1",
+            conversation_id="conv2", scope="character", card_type="preference",
+            content="The target content", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="preference",
+            content="The target content",
+        )
+        assert result is not None
+        assert result["card_id"] == "card_second"
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_duplicate_card_returns_none_when_no_bucket_match():
+    """When no card in the bucket matches, return None even if many rows exist."""
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="card_a", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Content A", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+        await insert_card(
+            db_path, card_id="card_b", user_id="u1", character_id="ch1",
+            conversation_id="conv2", scope="character", card_type="preference",
+            content="Content B", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        result = await find_duplicate_card(
+            db_path,
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+            user_id="u1",
+            character_id="ch1",
+            scope="character",
+            card_type="preference",
+            content="Content C",
+        )
+        assert result is None
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: merge_memory_cards rejects self-referencing survivor in superseded
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_rejects_survivor_appearing_in_superseded_ids():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await _seed_cards(db_path)
+
+        with pytest.raises(ValueError, match="cannot also appear in superseded_card_ids"):
+            await merge_memory_cards(
+                db_path,
+                survivor_card_id="card_a",
+                superseded_card_ids=["card_a", "card_b"],
+            )
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_merge_deduplicates_superseded_ids():
+    """Duplicate superseded_card_ids should be silently deduplicated."""
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await _seed_cards(db_path)
+
+        result = await merge_memory_cards(
+            db_path,
+            survivor_card_id="card_a",
+            superseded_card_ids=["card_b", "card_b", "card_b"],
+            merge_reason="exact_duplicate",
+            dry_run=True,
+        )
+        assert result["superseded_card_ids"] == ["card_b"]
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: same_scope_bucket includes library_id and card_type
+# ---------------------------------------------------------------------------
+
+
+def test_same_scope_bucket_different_library_not_match():
+    a = {"user_id": "u1", "character_id": "ch1", "scope": "character",
+         "library_id": "lib_1", "card_type": "preference"}
+    b = {"user_id": "u1", "character_id": "ch1", "scope": "character",
+         "library_id": "lib_2", "card_type": "preference"}
+    assert not same_scope_bucket(a, b)
+
+
+def test_same_scope_bucket_different_card_type_not_match():
+    a = {"user_id": "u1", "character_id": "ch1", "scope": "character",
+         "library_id": "lib_1", "card_type": "preference"}
+    b = {"user_id": "u1", "character_id": "ch1", "scope": "character",
+         "library_id": "lib_1", "card_type": "fact"}
+    assert not same_scope_bucket(a, b)
+
+
+def test_same_scope_bucket_same_library_and_type_match():
+    a = {"user_id": "u1", "character_id": "ch1", "scope": "character",
+         "library_id": "lib_1", "card_type": "preference"}
+    b = {"user_id": "u1", "character_id": "ch1", "scope": "character",
+         "library_id": "lib_1", "card_type": "preference"}
+    assert same_scope_bucket(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: find_exact_duplicate_groups respects library_id and card_type
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_exact_duplicates_does_not_cross_libraries():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="lib1_a", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Same content", status="approved",
+            library_id="lib_custom",
+        )
+        await insert_card(
+            db_path, card_id="lib1_b", user_id="u1", character_id="ch1",
+            conversation_id="conv2", scope="character", card_type="preference",
+            content="Same content", status="approved",
+            library_id="lib_custom",
+        )
+        # Same content, same scope, but different library — should NOT group
+        await insert_card(
+            db_path, card_id="lib2_a", user_id="u1", character_id="ch1",
+            conversation_id="conv3", scope="character", card_type="preference",
+            content="Same content", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        groups = await find_exact_duplicate_groups(db_path)
+        groups_with_content = [g for g in groups if len(g) >= 2]
+
+        # lib_custom has 2 duplicates
+        lib_custom_groups = [g for g in groups_with_content
+                             if all(c.get("library_id") == "lib_custom" for c in g)]
+        assert len(lib_custom_groups) == 1
+        assert len(lib_custom_groups[0]) == 2
+
+        # The lib_default card should NOT be grouped with the lib_custom cards
+        for group in groups_with_content:
+            libs = {c.get("library_id") for c in group}
+            assert len(libs) == 1, f"Group contains cards from multiple libraries: {libs}"
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+@pytest.mark.asyncio
+async def test_find_exact_duplicates_does_not_cross_card_types():
+    test_dir = make_test_dir()
+    db_path = str(test_dir / "memory.sqlite")
+    try:
+        await init_cards_db(db_path)
+        await insert_card(
+            db_path, card_id="pref_a", user_id="u1", character_id="ch1",
+            conversation_id="conv1", scope="character", card_type="preference",
+            content="Same content", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+        await insert_card(
+            db_path, card_id="pref_b", user_id="u1", character_id="ch1",
+            conversation_id="conv2", scope="character", card_type="preference",
+            content="Same content", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+        # Same content, same scope, but different card_type — should NOT group
+        await insert_card(
+            db_path, card_id="fact_a", user_id="u1", character_id="ch1",
+            conversation_id="conv3", scope="character", card_type="fact",
+            content="Same content", status="approved",
+            library_id=DEFAULT_MEMORY_LIBRARY_ID,
+        )
+
+        groups = await find_exact_duplicate_groups(db_path)
+        groups_with_content = [g for g in groups if len(g) >= 2]
+
+        # preference group should have 2 cards
+        pref_groups = [g for g in groups_with_content
+                       if all(c.get("card_type") == "preference" for c in g)]
+        assert len(pref_groups) == 1
+        assert len(pref_groups[0]) == 2
+
+        # fact card should NOT be in any group of size >= 2
+        for group in groups_with_content:
+            types = {c.get("card_type") for c in group}
+            assert len(types) == 1, f"Group contains cards of different types: {types}"
+    finally:
+        cleanup_test_dir(test_dir)
+
+
+# ---------------------------------------------------------------------------
 # Dataclass smoke tests
 # ---------------------------------------------------------------------------
 

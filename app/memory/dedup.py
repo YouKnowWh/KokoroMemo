@@ -112,13 +112,15 @@ def _bigrams(text: str) -> set[str]:
 def same_scope_bucket(card_a: dict, card_b: dict) -> bool:
     """Return True if two cards belong to the same scope bucket.
 
-    Two cards are in the same bucket when they share user_id AND
-    (character_id or both None) AND scope.
+    Two cards are in the same bucket when they share library_id AND
+    user_id AND (character_id or both None) AND scope AND card_type.
     """
     return (
-        card_a.get("user_id") == card_b.get("user_id")
+        card_a.get("library_id") == card_b.get("library_id")
+        and card_a.get("user_id") == card_b.get("user_id")
         and card_a.get("character_id") == card_b.get("character_id")
         and card_a.get("scope") == card_b.get("scope")
+        and card_a.get("card_type") == card_b.get("card_type")
     )
 
 
