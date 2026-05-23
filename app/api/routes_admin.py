@@ -99,6 +99,7 @@ async def create_conversation_profile_api(request: Request, data: dict = Body(..
 
 @router.put("/admin/conversation-profiles/{profile_id}")
 async def update_conversation_profile_api(profile_id: str, request: Request, data: dict = Body(...)):
+    from app.storage.sqlite_app import list_conversations
     """Update a custom conversation policy profile."""
     _require_admin(request)
     from app.memory.conversation_policy import BUILTIN_CONVERSATION_PROFILES
@@ -352,7 +353,7 @@ async def get_stats(request: Request):
     result: dict = {}
 
     try:
-        async with aiosqlite.connect(db_path) as db:
+        async with aiosqlite.connect(db_path, timeout=10.0) as db:
             cursor = await db.execute("SELECT status, COUNT(*) FROM memory_cards GROUP BY status")
             result["cards_by_status"] = dict(await cursor.fetchall())
 
@@ -701,8 +702,19 @@ async def list_memories(
     db_path = cfg.storage.sqlite.memory_db
     await init_cards_db(db_path)
 
+    if library_id:
+        async with aiosqlite.connect(db_path, timeout=10.0) as _db:
+            _db.row_factory = aiosqlite.Row
+            _cur = await _db.execute(
+                "SELECT db_path FROM memory_libraries WHERE library_id = ?", (library_id,)
+            )
+            _row = await _cur.fetchone()
+            if _row and _row["db_path"]:
+                db_path = _row["db_path"]
+                await init_cards_db(db_path)
+
     try:
-        async with aiosqlite.connect(db_path) as db:
+        async with aiosqlite.connect(db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
 
             where_clauses = ["status = ?"]
@@ -1183,6 +1195,7 @@ async def update_conversation_profile_api(conversation_id: str, request: Request
     from app.storage.sqlite_app import update_conversation_profile
 
     cfg = get_config()
+    from app.storage.sqlite_app import list_conversations
     old_item = next((item for item in (await list_conversations(cfg.storage.sqlite.app_db, limit=500, offset=0, status="all"))[0] if item.get("conversation_id") == conversation_id), None)
     item = await update_conversation_profile(
         cfg.storage.sqlite.app_db,
@@ -1370,7 +1383,7 @@ async def update_memory_card(card_id: str, data: dict = Body(...)):
     set_clauses = ", ".join(f"{k} = ?" for k in updates)
     values = list(updates.values()) + [card_id]
 
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         await db.execute(
             f"UPDATE memory_cards SET {set_clauses}, updated_at = datetime('now', 'localtime') WHERE card_id = ?",
@@ -1413,7 +1426,7 @@ async def delete_memory_card(card_id: str):
     cfg = get_config()
     db_path = cfg.storage.sqlite.memory_db
 
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "UPDATE memory_cards SET status = 'deleted', updated_at = datetime('now', 'localtime') WHERE card_id = ?",
             (card_id,),
@@ -1428,6 +1441,440 @@ async def delete_memory_card(card_id: str):
             pass
 
     return {"status": "ok"}
+
+
+# --- 记忆卡片去重与合并 API ---
+
+
+@router.post("/admin/memories/merge-preview")
+async def merge_preview_api(request: Request, data: dict = Body(...)):
+    """Dry-run preview of merging memory cards.
+
+    Request body:
+        survivor_card_id: str
+        superseded_card_ids: list[str]
+        merge_reason: str (optional, default "manual")
+    """
+    _require_admin(request)
+    from app.core.state import get_config
+    from app.storage.sqlite_cards import merge_memory_cards
+
+    cfg = get_config()
+    db_path = cfg.storage.sqlite.memory_db
+
+    survivor_card_id = (data.get("survivor_card_id") or "").strip()
+    superseded_card_ids = [cid.strip() for cid in (data.get("superseded_card_ids") or []) if cid and cid.strip()]
+
+    if not survivor_card_id:
+        raise HTTPException(status_code=400, detail="survivor_card_id is required")
+    if len(superseded_card_ids) < 1:
+        raise HTTPException(status_code=400, detail="superseded_card_ids must contain at least 1 card")
+
+    try:
+        preview = await merge_memory_cards(
+            db_path,
+            survivor_card_id=survivor_card_id,
+            superseded_card_ids=superseded_card_ids,
+            merge_reason=data.get("merge_reason", "manual"),
+            dry_run=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"status": "ok", "preview": preview}
+
+
+@router.post("/admin/memories/merge")
+async def merge_memory_cards_api(request: Request, data: dict = Body(...)):
+    """Execute a manual merge of duplicate memory cards.
+
+    Merges superseded cards into the survivor card (soft-deletes superseded).
+    Optionally re-syncs the survivor card vector.
+
+    Request body:
+        survivor_card_id: str
+        superseded_card_ids: list[str]
+        merge_reason: str (optional, default "manual")
+        sync_vector: bool (optional, default False)
+    """
+    _require_admin(request)
+    from app.core.services import get_embedding_provider, get_lancedb_store
+    from app.core.state import get_config
+    from app.memory.dedup import sync_after_card_merge
+    from app.storage.sqlite_cards import merge_memory_cards
+
+    cfg = get_config()
+    db_path = cfg.storage.sqlite.memory_db
+
+    survivor_card_id = (data.get("survivor_card_id") or "").strip()
+    superseded_card_ids = [cid.strip() for cid in (data.get("superseded_card_ids") or []) if cid and cid.strip()]
+
+    if not survivor_card_id:
+        raise HTTPException(status_code=400, detail="survivor_card_id is required")
+    if len(superseded_card_ids) < 1:
+        raise HTTPException(status_code=400, detail="superseded_card_ids must contain at least 1 card")
+
+    try:
+        result = await merge_memory_cards(
+            db_path,
+            survivor_card_id=survivor_card_id,
+            superseded_card_ids=superseded_card_ids,
+            merge_reason=data.get("merge_reason", "manual"),
+            dry_run=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    vector_result = None
+    if data.get("sync_vector"):
+        ep = get_embedding_provider(cfg)
+        store = get_lancedb_store(cfg)
+        if ep and store:
+            vector_result = await sync_after_card_merge(
+                db_path, survivor_card_id, superseded_card_ids, ep, store
+            )
+
+    response_data = {"status": "ok", "merge": result}
+    if vector_result:
+        response_data["vector_sync"] = vector_result
+    return response_data
+
+
+@router.post("/admin/memories/batch-merge")
+async def batch_merge_api(request: Request, data: dict = Body(...)):
+    """Execute multiple merges in a single request.
+
+    Request body:
+        merges: list[dict] — each with survivor_card_id, superseded_card_ids, merge_reason
+        sync_vector: bool (optional, default False)
+    """
+    _require_admin(request)
+    from app.core.services import get_embedding_provider, get_lancedb_store
+    from app.core.state import get_config
+    from app.memory.dedup import sync_after_card_merge
+    from app.storage.sqlite_cards import merge_memory_cards
+
+    cfg = get_config()
+    db_path = cfg.storage.sqlite.memory_db
+
+    merges = data.get("merges") or []
+    if not isinstance(merges, list) or len(merges) == 0:
+        raise HTTPException(status_code=400, detail="merges must be a non-empty list")
+
+    results = []
+    errors = []
+    for i, merge_spec in enumerate(merges):
+        survivor_id = (merge_spec.get("survivor_card_id") or "").strip()
+        superseded_ids = [cid.strip() for cid in (merge_spec.get("superseded_card_ids") or []) if cid and cid.strip()]
+        reason = merge_spec.get("merge_reason", "batch")
+
+        if not survivor_id or not superseded_ids:
+            errors.append({"index": i, "error": "survivor_card_id and superseded_card_ids are required"})
+            continue
+
+        try:
+            result = await merge_memory_cards(
+                db_path,
+                survivor_card_id=survivor_id,
+                superseded_card_ids=superseded_ids,
+                merge_reason=reason,
+                dry_run=False,
+            )
+            results.append({"index": i, "merge": result})
+
+            if data.get("sync_vector"):
+                ep = get_embedding_provider(cfg)
+                store = get_lancedb_store(cfg)
+                if ep and store:
+                    await sync_after_card_merge(
+                        db_path, survivor_id, superseded_ids, ep, store
+                    )
+        except ValueError as exc:
+            errors.append({"index": i, "error": str(exc)})
+
+    return {
+        "status": "ok",
+        "total": len(merges),
+        "succeeded": len(results),
+        "failed": len(errors),
+        "results": results,
+        "errors": errors,
+    }
+
+
+@router.get("/admin/memories/duplicates")
+async def list_duplicates_api(
+    request: Request,
+    mode: str = Query(default="exact"),
+    user_id: str | None = Query(default=None),
+    character_id: str | None = Query(default=None),
+    scope: str | None = Query(default=None),
+    min_similarity: float = Query(default=0.8, ge=0.0, le=1.0),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    """Scan for duplicate memory cards.
+
+    Modes:
+      - exact: groups of cards with identical content in the same scope
+      - near: pairs of cards with high content similarity (uses bigram similarity)
+
+    Query parameters:
+      mode: "exact" or "near"
+      user_id, character_id, scope: filter scope buckets
+      min_similarity: threshold for near-duplicate detection (default 0.8)
+      limit: max cards to scan (default 200)
+    """
+    _require_admin(request)
+    from app.core.state import get_config
+    from app.memory.dedup import content_similarity
+    from app.storage.sqlite_cards import find_exact_duplicate_groups, list_cards_for_dedup
+
+    if mode not in ("exact", "near"):
+        raise HTTPException(status_code=400, detail="mode must be 'exact' or 'near'")
+
+    cfg = get_config()
+    db_path = cfg.storage.sqlite.memory_db
+
+    if mode == "exact":
+        groups = await find_exact_duplicate_groups(
+            db_path,
+            user_id=user_id,
+            character_id=character_id,
+            scope=scope,
+        )
+        return {
+            "mode": "exact",
+            "groups": [
+                {
+                    "cards": [
+                        {
+                            "card_id": c["card_id"],
+                            "content": c["content"][:100],
+                            "scope": c["scope"],
+                            "importance": c.get("importance"),
+                            "created_at": c.get("created_at"),
+                        }
+                        for c in group
+                    ],
+                    "count": len(group),
+                }
+                for group in groups
+            ],
+            "total_groups": len(groups),
+            "total_duplicates": sum(len(g) for g in groups),
+        }
+
+    # near mode
+    cards = await list_cards_for_dedup(
+        db_path,
+        user_id=user_id,
+        character_id=character_id,
+        scope=scope,
+        limit=limit,
+    )
+    if len(cards) < 2:
+        return {"mode": "near", "pairs": [], "total_pairs": 0}
+
+    from app.memory.dedup import same_scope_bucket
+
+    pairs = []
+    seen: set[tuple[str, str]] = set()
+    for i in range(len(cards)):
+        for j in range(i + 1, len(cards)):
+            a, b = cards[i], cards[j]
+            key = tuple(sorted([a["card_id"], b["card_id"]]))
+            if key in seen:
+                continue
+            if not same_scope_bucket(a, b):
+                continue
+            sim = content_similarity(a.get("content", ""), b.get("content", ""))
+            if sim >= min_similarity:
+                seen.add(key)
+                pairs.append({
+                    "card_a": {
+                        "card_id": a["card_id"],
+                        "content": a["content"][:100],
+                        "scope": a["scope"],
+                        "importance": a.get("importance"),
+                        "created_at": a.get("created_at"),
+                    },
+                    "card_b": {
+                        "card_id": b["card_id"],
+                        "content": b["content"][:100],
+                        "scope": b["scope"],
+                        "importance": b.get("importance"),
+                        "created_at": b.get("created_at"),
+                    },
+                    "similarity": round(sim, 4),
+                })
+
+    pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    return {"mode": "near", "pairs": pairs, "total_pairs": len(pairs)}
+
+
+@router.post("/admin/memories/dedup")
+async def auto_dedup_api(request: Request, data: dict = Body(...)):
+    """Automatically detect and merge duplicate memory cards.
+
+    Modes:
+      - dry_run: scan for duplicates and return a merge plan
+      - apply: execute the merges
+
+    Request body:
+        mode: str — "dry_run" or "apply" (default "dry_run")
+        user_id: str (optional)
+        character_id: str (optional)
+        scope: str (optional)
+        min_similarity: float (optional, default 0.9)
+        limit: int (optional, default 500)
+    """
+    _require_admin(request)
+    from app.core.services import get_embedding_provider, get_lancedb_store
+    from app.core.state import get_config
+    from app.memory.dedup import content_similarity, same_scope_bucket
+    from app.storage.sqlite_cards import find_exact_duplicate_groups, list_cards_for_dedup, merge_memory_cards
+
+    dedup_mode = data.get("mode", "dry_run")
+    if dedup_mode not in ("dry_run", "apply"):
+        raise HTTPException(status_code=400, detail="mode must be 'dry_run' or 'apply'")
+
+    cfg = get_config()
+    db_path = cfg.storage.sqlite.memory_db
+
+    user_id = data.get("user_id")
+    character_id = data.get("character_id")
+    scope = data.get("scope")
+    min_similarity = float(data.get("min_similarity", 0.9))
+    limit = int(data.get("limit", 500))
+
+    merge_plan: list[dict] = []
+
+    # Phase 1: exact duplicates — keep the first card (by creation date) as survivor
+    exact_groups = await find_exact_duplicate_groups(
+        db_path,
+        user_id=user_id,
+        character_id=character_id,
+        scope=scope,
+    )
+    for group in exact_groups:
+        sorted_group = sorted(group, key=lambda c: c.get("created_at", ""))
+        survivor = sorted_group[0]
+        superseded = sorted_group[1:]
+        merge_plan.append({
+            "survivor_card_id": survivor["card_id"],
+            "superseded_card_ids": [c["card_id"] for c in superseded],
+            "reason": "exact_duplicate",
+            "survivor_content": survivor["content"][:80],
+            "superseded_count": len(superseded),
+        })
+
+    # Phase 2: near-duplicates — skip cards already in the exact plan
+    exact_ids: set[str] = set()
+    for group in exact_groups:
+        for c in group:
+            exact_ids.add(c["card_id"])
+
+    cards = await list_cards_for_dedup(
+        db_path,
+        user_id=user_id,
+        character_id=character_id,
+        scope=scope,
+        limit=limit,
+    )
+    remaining = [c for c in cards if c["card_id"] not in exact_ids]
+
+    near_pairs: list[tuple[dict, dict, float]] = []
+    seen_near: set[tuple[str, str]] = set()
+    for i in range(len(remaining)):
+        for j in range(i + 1, len(remaining)):
+            a, b = remaining[i], remaining[j]
+            key = tuple(sorted([a["card_id"], b["card_id"]]))
+            if key in seen_near:
+                continue
+            if not same_scope_bucket(a, b):
+                continue
+            sim = content_similarity(a.get("content", ""), b.get("content", ""))
+            if sim >= min_similarity:
+                seen_near.add(key)
+                near_pairs.append((a, b, sim))
+
+    # Build near-duplicate merge plan — prefer older card as survivor
+    near_plan_ids: set[str] = set()
+    for a, b, sim in near_pairs:
+        if a["card_id"] in near_plan_ids or b["card_id"] in near_plan_ids:
+            continue
+        survivor = a if (a.get("created_at", "") or "") <= (b.get("created_at", "") or "") else b
+        superseded = b if survivor is a else a
+        if survivor["card_id"] in near_plan_ids or superseded["card_id"] in near_plan_ids:
+            continue
+        near_plan_ids.add(survivor["card_id"])
+        near_plan_ids.add(superseded["card_id"])
+        merge_plan.append({
+            "survivor_card_id": survivor["card_id"],
+            "superseded_card_ids": [superseded["card_id"]],
+            "reason": "near_duplicate",
+            "similarity": round(sim, 4),
+            "survivor_content": survivor["content"][:80],
+            "superseded_count": 1,
+        })
+
+    if dedup_mode == "dry_run":
+        return {
+            "status": "ok",
+            "mode": "dry_run",
+            "merge_plan": merge_plan,
+            "total_merges": len(merge_plan),
+            "total_superseded": sum(m["superseded_count"] for m in merge_plan),
+            "exact_groups": len(exact_groups),
+            "near_pairs": len(near_pairs),
+        }
+
+    # apply mode
+    results = []
+    errors = []
+    ep = get_embedding_provider(cfg)
+    store = get_lancedb_store(cfg)
+    for item in merge_plan:
+        try:
+            result = await merge_memory_cards(
+                db_path,
+                survivor_card_id=item["survivor_card_id"],
+                superseded_card_ids=item["superseded_card_ids"],
+                merge_reason=item["reason"],
+                dry_run=False,
+            )
+            results.append({"merge": result})
+
+            if ep and store:
+                try:
+                    await sync_after_card_merge(
+                        db_path,
+                        item["survivor_card_id"],
+                        item["superseded_card_ids"],
+                        ep,
+                        store,
+                    )
+                except Exception:
+                    pass
+        except ValueError as exc:
+            errors.append({
+                "survivor_card_id": item["survivor_card_id"],
+                "error": str(exc),
+            })
+
+    active_merge_plan = [m for m in merge_plan if m["survivor_card_id"] not in {e.get("survivor_card_id") for e in errors}]
+    return {
+        "status": "ok",
+        "mode": "apply",
+        "total_planned": len(merge_plan),
+        "succeeded": len(results),
+        "failed": len(errors),
+        "results": results,
+        "errors": errors,
+        "total_superseded": sum(m["superseded_count"] for m in active_merge_plan),
+        "exact_groups": len(exact_groups),
+        "near_pairs": len(near_pairs),
+    }
 
 
 @router.get("/admin/memory-diagnostics")
@@ -1463,7 +1910,7 @@ async def deprecate_memory_card(card_id: str, note: str = Body(default="")):
     cfg = get_config()
     db_path = cfg.storage.sqlite.memory_db
 
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "UPDATE memory_cards SET status = 'deprecated', updated_at = datetime('now', 'localtime') WHERE card_id = ?",
             (card_id,),
@@ -2221,7 +2668,7 @@ async def reject_inbox_item(inbox_id: str, data=Body(default="")):
         latest_status = latest["status"] if latest else "missing"
         return {"status": "error", "message": f"Item already {latest_status}"}
     import aiosqlite
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "UPDATE memory_inbox SET discard_reason = ? WHERE inbox_id = ?",
             ("user_rejected", inbox_id),
@@ -2257,7 +2704,7 @@ async def restore_inbox_item(inbox_id: str):
         latest_status = latest["status"] if latest else "missing"
         return {"status": "error", "message": f"Item already {latest_status}"}
     import aiosqlite
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "UPDATE memory_inbox SET discard_reason = NULL WHERE inbox_id = ?",
             (inbox_id,),
@@ -2281,7 +2728,7 @@ async def delete_inbox_item(inbox_id: str):
     if item["status"] == "pending":
         return {"status": "error", "message": "待审核条目请先丢弃后再删除"}
     import aiosqlite
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute("DELETE FROM memory_inbox WHERE inbox_id = ?", (inbox_id,))
         await db.commit()
     return {"status": "ok"}
@@ -2500,7 +2947,7 @@ async def export_memory_library(library_id: str):
     db_path = cfg.storage.sqlite.memory_db
     await init_cards_db(db_path)
 
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         lib_cursor = await db.execute(
             "SELECT * FROM memory_libraries WHERE library_id = ?", (library_id,)
@@ -2654,7 +3101,7 @@ async def get_memory_graph(
     edges = []
 
     try:
-        async with aiosqlite.connect(db_path) as db:
+        async with aiosqlite.connect(db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             query = "SELECT card_id, card_type, content, importance, confidence, scope FROM memory_cards WHERE status = 'approved'"
             params: list = []
