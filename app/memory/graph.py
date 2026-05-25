@@ -17,7 +17,7 @@ async def insert_edge(
 ) -> str:
     """Insert a directed edge between two cards."""
     edge_id = generate_id("edge_")
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT OR IGNORE INTO memory_edges
                (edge_id, source_card_id, target_card_id, edge_type, weight, confidence)
@@ -33,7 +33,7 @@ async def get_active_edges_for_cards(db_path: str, card_ids: list[str]) -> list[
     if not card_ids:
         return []
     placeholders = ",".join(["?"] * len(card_ids))
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"""SELECT * FROM memory_edges

@@ -35,7 +35,7 @@ class ConversationConfigMixin:
     async def list_custom_conversation_profiles(self, include_inactive: bool = False) -> list[ConversationProfile]:
         await self.init_schema()
         where = "" if include_inactive else "WHERE status = 'active'"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"SELECT * FROM conversation_profiles {where} ORDER BY updated_at DESC, name ASC"
@@ -59,7 +59,7 @@ class ConversationConfigMixin:
         await self.init_schema()
         profile_id = data.get("profile_id") or generate_id("profile_")
         name = data.get("name") or "未命名会话方案"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             await db.execute(
                 """INSERT INTO conversation_profiles
                    (profile_id, name, description, table_template_id, mount_preset_id,
@@ -100,7 +100,7 @@ class ConversationConfigMixin:
 
     async def delete_custom_conversation_profile(self, profile_id: str) -> bool:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             cursor = await db.execute(
                 "UPDATE conversation_profiles SET status = 'deleted', updated_at = datetime('now', 'localtime') WHERE profile_id = ?",
                 (profile_id,),
@@ -110,7 +110,7 @@ class ConversationConfigMixin:
 
     async def get_default_conversation_config(self) -> ConversationConfig:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM conversation_default_config WHERE id = 'global'")
             row = await cursor.fetchone()
@@ -151,7 +151,7 @@ class ConversationConfigMixin:
         memory_write_policy = payload.get("memory_write_policy") or profile.memory_write_policy
         state_update_policy = payload.get("state_update_policy") or profile.state_update_policy
         injection_policy = payload.get("injection_policy") or profile.injection_policy
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             await db.execute(
                 """INSERT INTO conversation_default_config
                    (id, profile_id, table_template_id, mount_preset_id,
@@ -172,7 +172,7 @@ class ConversationConfigMixin:
 
     async def get_conversation_config(self, conversation_id: str) -> ConversationConfig | None:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM conversation_configs WHERE conversation_id = ?", (conversation_id,))
             row = await cursor.fetchone()
@@ -192,7 +192,7 @@ class ConversationConfigMixin:
         state_update_policy = payload.get("state_update_policy") or profile.state_update_policy
         injection_policy = payload.get("injection_policy") or profile.injection_policy
         created_from_default = 1 if payload.get("created_from_default") else 0
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             await db.execute(
                 """INSERT INTO conversation_configs
                    (conversation_id, profile_id, table_template_id, mount_preset_id,
@@ -244,7 +244,7 @@ class ConversationConfigMixin:
     async def update_conversation_character_refs(self, conversation_id: str, character_id: str | None) -> dict[str, int]:
         """更新单个会话状态数据中的角色引用。"""
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             items = await db.execute(
                 "UPDATE conversation_state_items SET character_id = ?, updated_at = datetime('now', 'localtime') WHERE conversation_id = ?",
                 (character_id, conversation_id),
@@ -255,7 +255,7 @@ class ConversationConfigMixin:
     async def merge_character_refs(self, source_character_id: str, target_character_id: str) -> dict[str, int]:
         """将状态板数据中的源角色引用迁移到目标角色。"""
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             items = await db.execute(
                 "UPDATE conversation_state_items SET character_id = ?, updated_at = datetime('now', 'localtime') WHERE character_id = ?",
                 (target_character_id, source_character_id),

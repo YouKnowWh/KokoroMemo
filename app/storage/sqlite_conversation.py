@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS injected_memory_logs (
 async def init_chat_db(db_path: str) -> None:
     """Initialize a per-conversation chat.sqlite."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.executescript(_CHAT_SCHEMA)
         await db.commit()
 
@@ -76,7 +76,7 @@ async def delete_chat_db_records(db_path: str, conversation_id: str) -> dict[str
     """删除会话聊天库中的请求、回复、注入日志、消息和轮次。"""
     if not Path(db_path).exists():
         return {"raw_responses": 0, "raw_requests": 0, "injected_memory_logs": 0, "messages": 0, "turns": 0}
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         result: dict[str, int] = {}
         for table in ["raw_responses", "raw_requests", "injected_memory_logs", "messages", "turns"]:
             cursor = await db.execute(f"DELETE FROM {table} WHERE conversation_id = ?", (conversation_id,))
@@ -88,7 +88,7 @@ async def delete_chat_db_records(db_path: str, conversation_id: str) -> dict[str
 async def save_raw_request(
     db_path: str, request_id: str, conversation_id: str, body_json: str, headers_json: str | None = None
 ) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "INSERT OR IGNORE INTO raw_requests (request_id, conversation_id, body_json, headers_json, created_at) VALUES (?, ?, ?, ?, datetime('now', 'localtime'))",
             (request_id, conversation_id, body_json, headers_json),
@@ -105,7 +105,7 @@ async def save_raw_response(
     stream_text: str | None = None,
     finish_reason: str | None = None,
 ) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT OR IGNORE INTO raw_responses
                (response_id, request_id, conversation_id, body_json, stream_text, finish_reason, created_at)
@@ -124,7 +124,7 @@ async def save_injected_memory_log(
     card_ids_json: str | None = None,
 ) -> None:
     """Persist the exact memory block injected into an upstream request."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT INTO injected_memory_logs
                (injection_id, request_id, conversation_id, injected_text, card_ids_json, created_at)
@@ -145,7 +145,7 @@ async def save_turn_and_messages(
     messages: list[dict],
 ) -> None:
     """Save a turn and its messages."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             "INSERT OR IGNORE INTO turns (turn_id, conversation_id, user_id, character_id, request_id, turn_index, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))",
             (turn_id, conversation_id, user_id, character_id, request_id, turn_index),
@@ -170,7 +170,7 @@ async def save_turn_and_messages(
 
 async def get_turn_count(db_path: str, conversation_id: str) -> int:
     """Get current turn count for a conversation."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM turns WHERE conversation_id = ?", (conversation_id,)
         )
@@ -180,7 +180,7 @@ async def get_turn_count(db_path: str, conversation_id: str) -> int:
 
 async def get_all_messages(db_path: str, conversation_id: str) -> list[dict]:
     """Return all messages in a conversation ordered by insertion order."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY rowid ASC",
@@ -195,7 +195,7 @@ async def get_recent_messages(db_path: str, conversation_id: str, limit: int = 3
 
     为了保留长会话的上下文起点，会把会话最早的 system 消息（若存在）置顶。
     """
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         recent_cursor = await db.execute(
             """
@@ -241,7 +241,7 @@ async def get_recent_messages(db_path: str, conversation_id: str, limit: int = 3
 
 async def get_conversation_message_summary(db_path: str, conversation_id: str) -> dict:
     """返回会话列表所需的消息摘要和计数。"""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
@@ -281,7 +281,7 @@ async def get_conversation_message_summary(db_path: str, conversation_id: str) -
 async def update_conversation_character(db_path: str, conversation_id: str, character_id: str | None) -> int:
     """更新已保存轮次的角色归属。"""
     await init_chat_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             "UPDATE turns SET character_id = ? WHERE conversation_id = ?",
             (character_id, conversation_id),
@@ -293,7 +293,7 @@ async def update_conversation_character(db_path: str, conversation_id: str, char
 async def merge_character_turn_refs(db_path: str, source_character_id: str, target_character_id: str) -> int:
     """将聊天轮次中的源角色引用迁移到目标角色。"""
     await init_chat_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             "UPDATE turns SET character_id = ? WHERE character_id = ?",
             (target_character_id, source_character_id),

@@ -225,7 +225,7 @@ async def init_state_db(db_path: str) -> None:
     """Initialize hot-state tables in memory.sqlite."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(path) as db:
+    async with aiosqlite.connect(path, timeout=10.0) as db:
         await db.executescript(_STATE_SCHEMA)
         await _ensure_columns(db, "retrieval_decisions", _RETRIEVAL_DECISION_COLUMNS)
         await _ensure_default_conversation_config(db)
@@ -236,7 +236,7 @@ async def init_state_db(db_path: str) -> None:
 async def delete_conversation_state_data(db_path: str, conversation_id: str) -> dict[str, int]:
     """删除指定会话关联的状态表格、诊断记录和策略配置。"""
     await init_state_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         row_cursor = await db.execute(
             "SELECT row_id FROM state_table_rows WHERE conversation_id = ?",
             (conversation_id,),

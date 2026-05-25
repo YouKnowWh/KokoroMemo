@@ -67,6 +67,7 @@ const typeOptions = [
   { label: t('memories.typeLabels.correction'), value: 'correction' },
   { label: t('memories.typeLabels.world_state'), value: 'world_state' },
   { label: t('memories.typeLabels.summary'), value: 'summary' },
+  { label: 'System Prompt', value: 'system_prompt' },
 ]
 
 const scopeEditOptions = [
@@ -99,7 +100,7 @@ function libraryName(libraryId: string) {
 }
 
 function typeLabel(type: string) {
-  const typeMap: Record<string, string> = { preference: t('memories.typeLabels.preference'), relationship: t('memories.typeLabels.relationship'), event: t('memories.typeLabels.event'), promise: t('memories.typeLabels.promise'), boundary: t('memories.typeLabels.boundary'), correction: t('memories.typeLabels.correction'), world_state: t('memories.typeLabels.world_state'), summary: t('memories.typeLabels.summary') }
+  const typeMap: Record<string, string> = { preference: t('memories.typeLabels.preference'), relationship: t('memories.typeLabels.relationship'), event: t('memories.typeLabels.event'), promise: t('memories.typeLabels.promise'), boundary: t('memories.typeLabels.boundary'), correction: t('memories.typeLabels.correction'), world_state: t('memories.typeLabels.world_state'), summary: t('memories.typeLabels.summary'), system_prompt: 'System Prompt' }
   return typeMap[type] || type
 }
 

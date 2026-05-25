@@ -17,7 +17,7 @@ class RetrievalDecisionsMixin:
         offset: int = 0,
     ) -> tuple[list[dict], int]:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             count_cursor = await db.execute(
                 "SELECT COUNT(*) FROM retrieval_decisions WHERE conversation_id = ?",
@@ -52,7 +52,7 @@ class RetrievalDecisionsMixin:
     ) -> str:
         await self.init_schema()
         decision_id = generate_id("gate_")
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             await db.execute(
                 """INSERT INTO retrieval_decisions
                    (decision_id, request_id, conversation_id, user_id, character_id, world_id, mode,

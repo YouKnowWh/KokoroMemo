@@ -28,18 +28,25 @@ def build_retrieval_query(
             latest_user_text = msg.get("content", "")
             break
 
-    # 构建近期上下文（最近 N 条消息，跳过系统消息）
+    # 构建近期上下文（最近 N 轮消息，跳过系统消息）
     non_system = [m for m in messages if m.get("role") != "system"]
     recent = non_system[-(max_recent_turns * 2):]
+    if latest_user_text:
+        for idx in range(len(recent) - 1, -1, -1):
+            if recent[idx].get("role") == "user" and recent[idx].get("content", "") == latest_user_text:
+                recent.pop(idx)
+                break
+
     recent_lines = []
     for m in recent:
         role = m.get("role", "")
-        content = m.get("content", "")[:200]
+        content = m.get("content", "")[:120]
         recent_lines.append(f"{role}: {content}")
     recent_context_text = "\n".join(recent_lines)
 
     # 用于向量化的合并查询文本
-    query_text = f"{latest_user_text}\n\n{recent_context_text}"
+    query_parts = [part for part in (latest_user_text, recent_context_text) if part]
+    query_text = "\n\n".join(query_parts)
 
     scope_filter = {
         "user_id": user_id,

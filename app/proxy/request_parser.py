@@ -79,7 +79,7 @@ async def resolve_context(request: Request, body: dict, root_dir: str, cfg=None)
     # 会话 ID
     conversation_id = _first_text(headers.get("x-conversation-id"), headers.get("x-chat-id"), headers.get("x-session-id"))
     if not conversation_id:
-        conversation_id = _metadata_value(meta, "conversation_id", "chat_id", "session_id", "chat_session_id", "thread_id")
+        conversation_id = _metadata_value(meta, "conversation_id", "chat_id", "session_id", "chat_session_id", "thread_id", "previous_response_id")
     explicit_conv_id = bool(conversation_id)
 
     # 角色 ID
@@ -91,18 +91,118 @@ async def resolve_context(request: Request, body: dict, root_dir: str, cfg=None)
     if not character_id:
         system_prompt = _stable_system_prompt(messages)
         if system_prompt:
-            character_id = f"char_{_hash_short(system_prompt)}"
+            # Check for inline [character_id: name] tag
+            import re as _re
+            m = _re.search(r'\[character_id:\s*(\S+)\s*\]', system_prompt)
+            if m:
+                character_id = sanitize_id(m.group(1))
+            else:
+                character_id = f"char_{_hash_short(system_prompt)}"
     if character_id:
         character_id = sanitize_id(character_id)
+    # Map system-prompt hashes to stable character names (multi-hash per character)
+    _CHAR_HASHES = {
+        'arona': ['char_538c35346c40', 'char_11ec99cfa6e6'],
+    }
+    for name, hashes in _CHAR_HASHES.items():
+        if character_id in hashes:
+            character_id = name
+            break
 
-    if explicit_conv_id and cfg:
-        existing_character_id = await _existing_character_for_conversation(cfg.storage.sqlite.app_db, sanitize_id(conversation_id))
-        if existing_character_id:
-            character_id = existing_character_id
+    # Cross-model conversation binding: find existing conv BEFORE hash fallback
+    if not explicit_conv_id and not conversation_id:
+        import aiosqlite
+        try:
+            async with aiosqlite.connect(cfg.storage.sqlite.app_db, timeout=10.0) as db:
+                if character_id:
+                    cur = await db.execute(
+                        "SELECT conversation_id FROM conversations WHERE character_id=? AND user_id=? ORDER BY last_seen_at DESC LIMIT 1",
+                        (character_id, user_id))
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        conversation_id = row[0]
+                if not conversation_id:
+                    cur = await db.execute(
+                        "SELECT conversation_id FROM conversations WHERE user_id=? ORDER BY last_seen_at DESC LIMIT 1",
+                        (user_id,))
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        conversation_id = row[0]
+        except: pass
+
     if not conversation_id:
         seed = f"{user_id}_{character_id or 'none'}"
         conversation_id = f"conv_{_hash_short(seed)}"
     conversation_id = sanitize_id(conversation_id)
+    import logging
+    logging.getLogger('kokoromemo.request').info(
+        'resolve: conv=%s user=%s char=%s explicit=%s headers=%s',
+        conversation_id[:12], user_id, str(character_id)[:20] if character_id else 'None',
+        explicit_conv_id,
+        str({k: headers.get(k) for k in ['x-conversation-id','x-character-id','x-user-id'] if headers.get(k)})[:100]
+    )
+
+    # Cross-model conversation binding: find existing conv by character or user
+    if not explicit_conv_id:
+        import aiosqlite
+        try:
+            async with aiosqlite.connect(cfg.storage.sqlite.app_db, timeout=10.0) as db:
+                if character_id:
+                    cur = await db.execute(
+                        "SELECT conversation_id FROM conversations WHERE character_id=? AND user_id=? ORDER BY last_seen_at DESC LIMIT 1",
+                        (character_id, user_id))
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        conversation_id = row[0]
+                elif not character_id:
+                    # Fallback: bind by user_id only
+                    cur = await db.execute(
+                        "SELECT conversation_id FROM conversations WHERE user_id=? ORDER BY last_seen_at DESC LIMIT 1",
+                        (user_id,))
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        conversation_id = row[0]
+                        # Also get the character_id from the bound conversation
+                        cur2 = await db.execute(
+                            "SELECT character_id FROM conversations WHERE conversation_id=?",
+                            (conversation_id,))
+                        row2 = await cur2.fetchone()
+                        if row2 and row2[0]:
+                            character_id = row2[0]
+        except: pass
+
+    # Once a conversation already exists in app.sqlite, its manually reassigned
+    # character binding should win over any newly inferred request character.
+    if cfg:
+        existing_character_id = await _existing_character_for_conversation(
+            cfg.storage.sqlite.app_db,
+            conversation_id,
+        )
+        if existing_character_id:
+            character_id = existing_character_id
+
+    if cfg and character_id:
+        # Do not store raw system prompts as memory. Import only compact persona
+        # facts as normal memory cards after the final character binding is known.
+        system_prompt = _stable_system_prompt(messages)
+        if system_prompt and len(system_prompt) > 50:
+            import asyncio
+
+            async def _import_persona_prompt():
+                try:
+                    from app.memory.system_prompt_importer import import_system_prompt_persona_cards
+
+                    await import_system_prompt_persona_cards(
+                        cfg.storage.sqlite.memory_db,
+                        system_prompt,
+                        user_id=user_id,
+                        character_id=character_id,
+                        conversation_id=conversation_id,
+                    )
+                except Exception:
+                    pass
+
+            asyncio.create_task(_import_persona_prompt())
 
     # 智能会话检测：未显式提供 ID 时，检查是否需要开启新会话
     if not explicit_conv_id and cfg:
@@ -154,7 +254,7 @@ async def _maybe_new_session(
 
     app_db = cfg.storage.sqlite.app_db
     try:
-        async with aiosqlite.connect(app_db) as db:
+        async with aiosqlite.connect(app_db, timeout=10.0) as db:
             cursor = await db.execute(
                 "SELECT last_seen_at FROM conversations WHERE conversation_id = ?",
                 (base_conv_id,),
@@ -180,7 +280,7 @@ async def _maybe_new_session(
                 if len(non_system) <= 1:
                     chat_db = str(Path(root_dir, "conversations", base_conv_id, "chat.sqlite"))
                     if Path(chat_db).exists():
-                        async with aiosqlite.connect(chat_db) as chat:
+                        async with aiosqlite.connect(chat_db, timeout=10.0) as chat:
                             cursor2 = await chat.execute("SELECT COUNT(*) FROM turns")
                             count_row = await cursor2.fetchone()
                             if count_row and count_row[0] > 5:
@@ -205,7 +305,7 @@ async def _existing_character_for_conversation(app_db: str, conversation_id: str
         from app.storage.sqlite_app import init_app_db
 
         await init_app_db(app_db)
-        async with aiosqlite.connect(app_db) as db:
+        async with aiosqlite.connect(app_db, timeout=10.0) as db:
             cursor = await db.execute(
                 "SELECT character_id FROM conversations WHERE conversation_id = ?",
                 (conversation_id,),

@@ -36,6 +36,27 @@ _SECTION_ORDER = [
 ]
 
 
+def _has_relevant_system_prompt(messages: list[dict], character_name: str | None) -> bool:
+    system_texts = [
+        m.get("content", "")
+        for m in messages
+        if m.get("role") == "system" and isinstance(m.get("content"), str)
+    ]
+    if not system_texts:
+        return False
+    if character_name:
+        needle = character_name.lower()
+        if any(needle in text.lower() for text in system_texts):
+            return True
+    # Common persona markers mean the request already carries role binding.
+    markers = ("[character_id:", "persona", "character", "你是", "角色", "人设")
+    return any(any(marker in text.lower() for marker in markers) for text in system_texts)
+
+
+def _is_initial_persona_card(card: MemoryCandidate) -> bool:
+    return getattr(card, "title", "").startswith("initial_persona:")
+
+
 def inject_cards(
     messages: list[dict],
     candidates: list[MemoryCandidate],
@@ -59,8 +80,13 @@ def inject_cards(
 
     # 按分段对候选卡片分组
     sections: dict[str, list[MemoryCandidate]] = {s: [] for s in _SECTION_ORDER}
+    has_relevant_system_prompt = _has_relevant_system_prompt(messages, character_name)
 
     for c in candidates[:max_count]:
+        if c.card_type == "system_prompt":
+            continue
+        if has_relevant_system_prompt and _is_initial_persona_card(c):
+            continue
         section = _TYPE_TO_SECTION.get(c.card_type, "当前相关记忆")
         if section in sections:
             sections[section].append(c)
@@ -99,7 +125,7 @@ def inject_cards(
     if not section_texts:
         return messages
 
-    raw_text = _INJECTION_TEMPLATE.format(sections="\n".join(section_texts))
+    raw_text = _INJECTION_TEMPLATE.replace("{sections}", "\n".join(section_texts))
 
     # 解析模板变量
     full_text = resolve_variables(
@@ -116,7 +142,7 @@ def inject_cards(
 
     memory_msg = {"role": "system", "content": full_text}
 
-    # 插入到第一条系统消息之后
+    # 插入到第一条系统消息之后（缓存友好：稳定前缀在前）
     result = list(messages)
     insert_idx = 0
     for i, m in enumerate(result):

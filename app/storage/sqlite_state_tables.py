@@ -118,7 +118,7 @@ class StateTablesMixin:
     async def list_table_templates(self, include_inactive: bool = False) -> list[StateTableTemplate]:
         await self.init_schema()
         where = "" if include_inactive else "WHERE status = 'active'"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"SELECT * FROM state_table_templates {where} ORDER BY is_builtin DESC, name ASC"
@@ -127,7 +127,7 @@ class StateTablesMixin:
 
     async def get_table_template(self, template_id: str) -> StateTableTemplate | None:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM state_table_templates WHERE template_id = ?", (template_id,))
             template_row = await cursor.fetchone()
@@ -165,7 +165,7 @@ class StateTablesMixin:
     async def save_table_template(self, template: StateTableTemplate) -> StateTableTemplate:
         await self.init_schema()
         template_id = template.template_id or generate_id("tpl_custom_")
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             existing_cursor = await db.execute("SELECT is_builtin FROM state_table_templates WHERE template_id = ?", (template_id,))
             existing = await existing_cursor.fetchone()
             if existing and int(existing[0]) == 1:
@@ -408,7 +408,7 @@ class StateTablesMixin:
 
     async def delete_table_template(self, template_id: str) -> bool:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             cursor = await db.execute(
                 "SELECT is_builtin FROM state_table_templates WHERE template_id = ? AND status = 'active'",
                 (template_id,),
@@ -450,7 +450,7 @@ class StateTablesMixin:
             where.append("status = ?")
             params.append(status)
         where_sql = " AND ".join(where)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"""SELECT * FROM state_table_rows WHERE {where_sql}
@@ -478,7 +478,7 @@ class StateTablesMixin:
         await self.init_schema()
         row_id = row.row_id or generate_id("state_row_")
         values = values or {key: cell.value for key, cell in row.cells.items()}
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             await db.execute(
                 """INSERT INTO state_table_rows
                    (row_id, conversation_id, template_id, table_id, table_key, status, priority,
@@ -534,7 +534,7 @@ class StateTablesMixin:
 
     async def update_single_cell(self, row_id: str, column_key: str, value: str) -> dict[str, Any] | None:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT conversation_id, table_key, table_id FROM state_table_rows WHERE row_id = ?",
@@ -595,7 +595,7 @@ class StateTablesMixin:
 
     async def update_table_row_status(self, row_id: str, status: str, reason: str | None = None) -> bool:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             cursor = await db.execute("SELECT conversation_id, table_key FROM state_table_rows WHERE row_id = ?", (row_id,))
             existing = await cursor.fetchone()
             if not existing:
@@ -629,7 +629,7 @@ class StateTablesMixin:
     ) -> str:
         await self.init_schema()
         event_id = generate_id("state_evt_")
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             await db.execute(
                 """INSERT INTO state_table_events
                    (event_id, conversation_id, request_id, turn_id, event_type, table_key, row_id,
@@ -666,7 +666,7 @@ class StateTablesMixin:
             where.append("turn_id = ?")
             params.append(turn_id)
         where_sql = " AND ".join(where)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 f"SELECT * FROM state_table_events WHERE {where_sql} ORDER BY created_at DESC LIMIT ?",
@@ -690,7 +690,7 @@ class StateTablesMixin:
     async def revert_table_events(self, conversation_id: str, event_ids: list[str]) -> int:
         await self.init_schema()
         reverted = 0
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             for event_id in event_ids:
                 cursor = await db.execute(
@@ -745,7 +745,7 @@ class StateTablesMixin:
         if not row_ids:
             return 0
         affected = 0
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             placeholders = ",".join("?" for _ in row_ids)
             if action == "delete":
                 cursor = await db.execute(
@@ -770,7 +770,7 @@ class StateTablesMixin:
 
     async def get_cell_history(self, row_id: str, column_key: str, limit: int = 20) -> list[dict[str, Any]]:
         await self.init_schema()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, timeout=10.0) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """SELECT event_id, event_type, before_json, after_json, reason, turn_id, created_at

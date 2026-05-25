@@ -6,6 +6,24 @@ import httpx
 
 from app.providers.embedding_base import EmbeddingProvider
 
+_shared_embedding_http_client: httpx.AsyncClient | None = None
+
+
+def get_embedding_http_client(timeout: int) -> httpx.AsyncClient:
+    global _shared_embedding_http_client
+    if _shared_embedding_http_client is None or _shared_embedding_http_client.is_closed:
+        _shared_embedding_http_client = httpx.AsyncClient(timeout=timeout)
+    else:
+        _shared_embedding_http_client.timeout = httpx.Timeout(timeout)
+    return _shared_embedding_http_client
+
+
+async def close_embedding_http_client() -> None:
+    global _shared_embedding_http_client
+    if _shared_embedding_http_client is not None and not _shared_embedding_http_client.is_closed:
+        await _shared_embedding_http_client.aclose()
+    _shared_embedding_http_client = None
+
 
 class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
     def __init__(self, base_url: str, api_key: str, model: str, dimension: int, timeout: int = 8):
@@ -28,10 +46,10 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
         }
         payload = {"model": self.model, "input": texts}
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+        client = get_embedding_http_client(self.timeout)
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
 
         embeddings = []
         for item in sorted(data["data"], key=lambda x: x["index"]):

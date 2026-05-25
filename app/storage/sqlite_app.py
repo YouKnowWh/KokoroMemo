@@ -98,7 +98,7 @@ async def _ensure_columns(db: aiosqlite.Connection, table: str, columns: dict[st
 async def init_app_db(db_path: str) -> None:
     """Initialize app.sqlite with schema."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.executescript(_APP_SCHEMA)
         await _ensure_columns(db, "characters", _CHARACTER_COLUMNS)
         await _ensure_columns(db, "character_defaults", _CHARACTER_DEFAULT_COLUMNS)
@@ -115,7 +115,7 @@ async def upsert_conversation(
     conv_path: str,
 ) -> None:
     """注册或刷新会话索引；归档会话重新收到消息时恢复为活跃。"""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """
             INSERT INTO conversations (conversation_id, user_id, character_id, client_name, path, first_seen_at, last_seen_at, status)
@@ -144,7 +144,7 @@ async def upsert_character(
     The characters table is the canonical record of "which characters this user has interacted with";
     insertion happens lazily when a chat request with a known character_id arrives.
     """
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """
             INSERT INTO characters (character_id, user_id, display_name, system_prompt_hash, source)
@@ -170,7 +170,7 @@ async def update_character_profile(
     user_id: str = "default",
 ) -> None:
     aliases_json = json.dumps(aliases or [], ensure_ascii=False)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """
             INSERT INTO characters (character_id, user_id, display_name, aliases_json, notes, source)
@@ -192,7 +192,7 @@ async def merge_character_profile(db_path: str, source_character_id: str, target
     await init_app_db(db_path)
     if source_character_id == target_character_id:
         return {"conversations": 0, "characters": 0, "defaults": 0}
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM characters WHERE character_id = ?", (source_character_id,))
         source = await cursor.fetchone()
@@ -228,7 +228,7 @@ async def merge_character_profile(db_path: str, source_character_id: str, target
 async def delete_character_profile(db_path: str, character_id: str, clear_conversations: bool = False) -> dict[str, int]:
     """删除角色档案和默认策略；可选清空会话中的角色归属。"""
     await init_app_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         conversations_count = 0
         if clear_conversations:
             conversations = await db.execute(
@@ -244,7 +244,7 @@ async def delete_character_profile(db_path: str, character_id: str, clear_conver
 
 async def get_character_defaults(db_path: str, character_id: str) -> dict | None:
     """Get default template and library config for a character."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM character_defaults WHERE character_id = ?",
@@ -291,7 +291,7 @@ async def set_character_defaults(
     state_update_policy = state_update_policy or profile.state_update_policy
     injection_policy = injection_policy or profile.injection_policy
     library_ids_json = json.dumps(library_ids or ["lib_default"])
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """
             INSERT INTO character_defaults
@@ -332,7 +332,7 @@ async def set_character_defaults(
 async def list_characters(db_path: str) -> list[dict]:
     """List all known characters."""
     await init_app_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -390,7 +390,7 @@ async def discover_characters(db_path: str) -> list[dict]:
     in the configured defaults from `character_defaults`.
     """
     await init_app_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
@@ -455,7 +455,7 @@ async def list_conversations(
 ) -> tuple[list[dict], int]:
     """按状态列出会话，默认隐藏已归档会话。"""
     await init_app_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         where = ""
         params: list[str | int] = []
@@ -498,7 +498,7 @@ async def list_conversations(
 
 async def list_character_conversations(db_path: str, character_id: str) -> list[dict]:
     await init_app_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT conversation_id, user_id, character_id, client_name, title, first_seen_at, last_seen_at
@@ -537,7 +537,7 @@ async def update_conversation_profile(
     if not updates:
         return None
     params.append(conversation_id)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             f"UPDATE conversations SET {', '.join(updates)}, last_seen_at = last_seen_at WHERE conversation_id = ?",
@@ -558,7 +558,7 @@ async def update_conversation_profile(
 async def delete_conversation(db_path: str, conversation_id: str) -> bool:
     """从应用索引中真正删除会话记录。"""
     await init_app_db(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             "DELETE FROM conversations WHERE conversation_id = ?",
             (conversation_id,),

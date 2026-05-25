@@ -1,0 +1,135 @@
+compatibility:
+  cors_enabled: true
+  expose_root_chat_completions: true
+  expose_v1_models: true
+  exposed_models: []
+embedding:
+  api_key: ''
+  api_key_env: LLM_API_KEY
+  base_url: https://llm.alex045.xyz/v1
+  batch_size: 16
+  dimension: 4096
+  enabled: true
+  model: Embedder
+  normalize: true
+  provider: openai_compatible
+  timeout_seconds: 8
+llm:
+  api_key: ''
+  api_key_env: LLM_API_KEY
+  base_url: https://llm.alex045.xyz/v1
+  forward_mode: passthrough
+  model: Flash
+  provider: openai_compatible
+  timeout_seconds: 120
+memory:
+  enabled: true
+  extraction:
+    discarded_keep_limit: 200
+    extract_after_each_turn: false
+    fallback_rule_based: true
+    min_confidence: 0.55
+    min_importance: 0.45
+  extraction_enabled: true
+  final_top_k: 6
+  hot_context:
+    enabled: true
+    inject_always: true
+    max_chars: 1200
+  inject_enabled: true
+  judge:
+    api_key: ''
+    api_key_env: LLM_API_KEY
+    base_url: https://llm.alex045.xyz/v1
+    enabled: true
+    mode: model_only
+    model: Flash
+    prompt: ''
+    provider: openai_compatible
+    temperature: 0.0
+    timeout_seconds: 30
+    user_rules: []
+  max_injected_chars: 1500
+  max_recent_turns_for_query: 6
+  retrieval_gate:
+    enabled: true
+    mode: auto
+    skip_when_latest_user_text_chars_below: 4
+    skip_when_state_is_sufficient: true
+    trigger_keywords:
+    - 记得
+    - 还记得
+    - 上次
+    - 以前
+    - 之前
+    - 曾经
+    - 约定
+    - 我们说过
+    - 你答应过
+    - 那个人
+    - 那个地方
+    - 那个东西
+    - 叫什么
+    - 发生过什么
+    vector_search_every_n_turns: 6
+    vector_search_on_new_session: true
+    vector_search_when_state_confidence_below: 0.65
+  scopes:
+    include_character: true
+    include_conversation: true
+    include_global: true
+  scoring:
+    confidence_weight: 0.05
+    importance_weight: 0.2
+    recency_weight: 0.1
+    scope_weight: 0.1
+    vector_weight: 0.55
+  state_updater:
+    api_key: ''
+    api_key_env: STATE_FILLER_API_KEY
+    auto_expire_resolved_items: true
+    base_url: ''
+    enabled: false
+    min_confidence: 0.55
+    model: Flash
+    prompt: ''
+    provider: openai_compatible
+    temperature: 0.0
+    timeout_seconds: 30
+    update_after_each_turn: true
+    update_every_n_turns: 1
+  vector_top_k: 30
+rerank:
+  api_key: ''
+  api_key_env: MODELARK_API_KEY
+  base_url: https://ai.gitee.com/v1
+  candidate_top_k: 30
+  enabled: false
+  final_top_k: 8
+  max_documents_per_request: 20
+  model: Qwen3-Reranker-8B
+  provider: modelark
+  timeout_seconds: 8
+server:
+  admin_token: ''
+  admin_token_env: ADMIN_TOKEN
+  allow_remote_access: false
+  host: 127.0.0.1
+  log_level: INFO
+  port: 14514
+  timezone: ''
+  webui_port: 14515
+storage:
+  lancedb:
+    create_fts_index: true
+    metric: cosine
+    path: ./data/vector_indexes/qwen3_embedding_4096/lancedb
+    table: memories
+    text_column: content
+    vector_column: vector
+  root_dir: ./data
+  sqlite:
+    app_db: ./data/app.sqlite
+    busy_timeout_ms: 5000
+    journal_mode: WAL
+    memory_db: ./data/memory/memory.sqlite

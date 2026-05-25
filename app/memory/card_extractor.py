@@ -26,6 +26,9 @@ logger = logging.getLogger("kokoromemo.card_extractor")
 # long-term memory pollution from rapidly-changing task state.
 _TASK_STATE_TYPES = frozenset({"task_state", "task_progress", "quest_progress"})
 
+# Card types that should never be stored — they're noise written by legacy plugin paths.
+BLOCKED_TYPES = frozenset({"task_state", "tool_result", "artifact", "checkpoint", "summary", "event", "system_prompt"})
+
 
 def default_card_title(content: str, card_type: str, max_len: int = 80) -> str:
     """Generate a fallback card title when the LLM doesn't provide one.
@@ -236,6 +239,11 @@ async def extract_and_route(
                 discarded_written = True
                 logger.debug("Discarded semantic near-duplicate: %s", mem.content[:50])
                 continue
+
+        # Block noise card types written by legacy plugin paths
+        if mem.memory_type in BLOCKED_TYPES:
+            logger.debug("Blocked noise card type %s, skipping", mem.memory_type)
+            continue
 
         # Volatile task_state routing: always pending to avoid long-term clutter
         if mem.memory_type in _TASK_STATE_TYPES:

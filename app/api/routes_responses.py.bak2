@@ -1,0 +1,338 @@
+"""OpenAI Responses API proxy routes (/v1/responses).
+
+For GPT models: memory injection via ChatPipeline, LLM via openai-oauth direct.
+For non-GPT: OpenAI chat conversion through LiteLLM.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from typing import Any
+
+import httpx
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.pipeline.chat import ChatPipeline
+
+router = APIRouter()
+
+_GPT_PROXY_URL = "http://127.0.0.1:10531/v1/responses"
+
+
+def _is_gpt_model(model: str) -> bool:
+    return model.startswith("gpt-") if model else False
+
+
+def _extract_text(content: Any) -> str:
+    if isinstance(content, str): return content
+    if isinstance(content, list):
+        parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") in {"input_text", "output_text", "text"}]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _role(item: dict) -> str:
+    r = item.get("role", "user")
+    return r if r in {"system", "user", "assistant", "developer"} else "user"
+
+
+def _input_to_openai(input_data: Any) -> list[dict[str, Any]]:
+    if isinstance(input_data, str): return [{"role": "user", "content": input_data}]
+    if not isinstance(input_data, list): return []
+    msgs = []
+    for item in input_data:
+        if isinstance(item, dict):
+            text = _extract_text(item.get("content"))
+            if text: msgs.append({"role": _role(item), "content": text})
+    return msgs
+
+
+# --- GPT: memory + persistence + direct proxy ---
+
+async def _gpt_handle(raw_body: dict[str, Any], request: Request):
+    """Full GPT pipeline: persist → memory → LLM → persist response → post-process."""
+    import logging
+    logger = logging.getLogger("kokoromemo.responses")
+
+    messages = _input_to_openai(raw_body.get("input"))
+    if not messages:
+        return JSONResponse(status_code=400, content={"error": {"message": "No input", "type": "invalid_request"}})
+
+    # Build OpenAI body for ChatPipeline (pass through user + metadata for conversation binding)
+    openai_body = {
+        "model": raw_body.get("model", "gpt-5.4"),
+        "messages": messages,
+        "stream": False,
+    }
+    # Pass through identity fields for conversation continuity
+    for key in ("user", "metadata", "previous_response_id"):
+        if raw_body.get(key):
+            openai_body[key] = raw_body[key]
+
+    pipeline = ChatPipeline()
+    try:
+        prepared = await pipeline.prepare(request, raw_body=openai_body)
+    except Exception as e:
+        logger.warning("GPT prepare failed: %s", e)
+        return JSONResponse(status_code=500, content={"error": {"message": f"Prepare failed: {e}"}})
+
+    ctx = prepared.ctx
+    cfg = prepared.cfg
+
+    # Memory injection
+    memory_text = None
+    try:
+        from app.memory.query_builder import build_retrieval_query
+        from app.memory.retrieval_gate import RetrievalGateInput, decide_retrieval
+        from app.storage.sqlite_conversation import get_turn_count
+
+        query = build_retrieval_query(messages, ctx.user_id, ctx.character_id, ctx.conversation_id,
+                                       max_recent_turns=cfg.memory.max_recent_turns_for_query)
+
+        should_retrieve = True
+        if cfg.memory.retrieval_gate.enabled:
+            turn_index = await get_turn_count(ctx.chat_db_path, ctx.conversation_id)
+            decision = decide_retrieval(RetrievalGateInput(
+                query=query, state_row_count=prepared.state_row_count,
+                avg_state_confidence=prepared.avg_state_confidence,
+                turn_index=turn_index, mode=cfg.memory.retrieval_gate.mode,
+                vector_search_on_new_session=cfg.memory.retrieval_gate.vector_search_on_new_session,
+                vector_search_every_n_turns=cfg.memory.retrieval_gate.vector_search_every_n_turns,
+                vector_search_when_state_confidence_below=cfg.memory.retrieval_gate.vector_search_when_state_confidence_below,
+                trigger_keywords=cfg.memory.retrieval_gate.trigger_keywords,
+                skip_when_latest_user_text_chars_below=cfg.memory.retrieval_gate.skip_when_latest_user_text_chars_below,
+                skip_when_state_is_sufficient=cfg.memory.retrieval_gate.skip_when_state_is_sufficient,
+            ))
+            should_retrieve = decision.should_retrieve
+
+        if should_retrieve:
+            ep = pipeline.services.get_embedding_provider(cfg)
+            store = pipeline.services.get_lancedb_store(cfg)
+            if ep and store:
+                from app.memory.card_retriever import retrieve_cards
+                from app.memory.card_injector import inject_cards
+
+                allowed = {s for s, e in (("global", cfg.memory.scopes.include_global),
+                    ("character", cfg.memory.scopes.include_character),
+                    ("conversation", cfg.memory.scopes.include_conversation)) if e}
+
+                candidates = await retrieve_cards(query, ep, store,
+                    cards_db_path=cfg.storage.sqlite.memory_db,
+                    vector_top_k=cfg.memory.vector_top_k, final_top_k=cfg.memory.final_top_k,
+                    allowed_scopes=allowed)
+
+                if candidates:
+                    dummy = [{"role": "user", "content": ""}]
+                    injected = inject_cards(dummy, candidates, max_chars=cfg.memory.max_injected_chars,
+                        max_count=cfg.memory.final_top_k, username=ctx.user_id,
+                        character_name=ctx.character_id, model_name="gpt-5.4",
+                        conversation_id=ctx.conversation_id)
+                    for msg in injected:
+                        if msg["role"] == "system" and "【KokoroMemo" in msg.get("content", ""):
+                            memory_text = msg["content"]
+                            break
+    except Exception as e:
+        logger.warning("GPT memory injection failed: %s", e)
+
+    # Build final Responses body
+    # Build forward body for openai-oauth: strip KokoroMemo-internal fields
+    body_with_memory = {k: v for k, v in raw_body.items() if k not in ("user", "metadata", "previous_response_id")}
+    if memory_text:
+        instructions = raw_body.get("instructions", "") or ""
+        body_with_memory["instructions"] = f"{instructions}\n\n{memory_text}".strip()
+
+    stream = bool(raw_body.get("stream", False))
+
+    # Call openai-oauth
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            if stream:
+                response = _gpt_stream(body_with_memory, prepared, pipeline, messages)
+            else:
+                r = await client.post(_GPT_PROXY_URL, json=body_with_memory)
+                if r.status_code != 200:
+                    return JSONResponse(status_code=502, content={
+                        "error": {"message": f"GPT upstream error: {r.status_code}", "type": "proxy_error"}})
+                data = r.json()
+                response = JSONResponse(status_code=200, content=data)
+
+                # Persist response + schedule post-processing in background
+                assistant_text = ""
+                for out in data.get("output", []):
+                    for c in out.get("content", []):
+                        if c.get("type") == "output_text":
+                            assistant_text += c.get("text", "")
+
+                if assistant_text:
+                    asyncio.create_task(_gpt_post_process(prepared, pipeline.services, messages, assistant_text))
+
+            return response
+    except Exception as e:
+        logger.error("GPT upstream call failed: %s", e)
+        return JSONResponse(status_code=502, content={
+            "error": {"message": f"GPT upstream failed: {e}", "type": "proxy_error"}})
+
+
+def _gpt_stream(body: dict, prepared, pipeline, messages: list):
+    """Stream GPT response and schedule post-processing on completion."""
+    collected: list[str] = []
+
+    async def generator():
+        nonlocal collected
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            async with client.stream("POST", _GPT_PROXY_URL, json=body) as r:
+                if r.status_code != 200:
+                    text = await r.aread()
+                    yield f"data: {json.dumps({'type': 'error', 'error': {'message': text.decode()[:500]}}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                async for line in r.aiter_lines():
+                    if line:
+                        yield f"{line}\n\n"
+                        if line.startswith("data: "):
+                            try:
+                                evt = json.loads(line[6:])
+                                if evt.get("type") == "response.output_text.delta":
+                                    collected.append(evt.get("delta", ""))
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+
+    async def wrapped_generator():
+        async for chunk in generator():
+            yield chunk
+        # Post-process after stream completes
+        full_text = "".join(collected)
+        if full_text:
+            await _gpt_post_process(prepared, pipeline.services, messages, full_text)
+
+    return StreamingResponse(wrapped_generator(), media_type="text/event-stream")
+
+
+async def _gpt_post_process(prepared, services, messages: list, assistant_text: str):
+    """Persist response and schedule memory extraction."""
+    try:
+        from app.pipeline.chat import _persist_response_turn, _schedule_post_process_turn
+
+        ctx = prepared.ctx
+        cfg = prepared.cfg
+        turn_id, turn_index = await _persist_response_turn(
+            ctx, list(messages), assistant_text,
+            json.dumps({"content": assistant_text}), None,
+        )
+        await _schedule_post_process_turn(
+            ctx, cfg, services, list(messages), assistant_text,
+            turn_id, turn_index,
+            name=f"post_process_gpt:{ctx.request_id}",
+        )
+    except Exception:
+        import logging
+        logging.getLogger("kokoromemo.responses").warning("GPT post-process failed", exc_info=True)
+
+
+# --- Non-GPT: OpenAI chat conversion ---
+
+def _tools_to_openai(tools: list[dict]) -> list[dict]:
+    result = []
+    for t in tools:
+        if t.get("type") == "function":
+            result.append({"type": "function", "function": {
+                "name": t.get("name", ""), "description": t.get("description", ""),
+                "parameters": t.get("parameters") or {"type": "object", "properties": {}},
+            }})
+    return result
+
+
+def request_to_openai(body: dict[str, Any]) -> dict[str, Any]:
+    payload = {"model": body.get("model"), "messages": _input_to_openai(body.get("input")),
+               "stream": bool(body.get("stream"))}
+    if body.get("temperature") is not None: payload["temperature"] = body["temperature"]
+    if body.get("max_output_tokens") is not None: payload["max_tokens"] = body["max_output_tokens"]
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        payload["tools"] = _tools_to_openai(tools)
+        if body.get("tool_choice") is not None: payload["tool_choice"] = body["tool_choice"]
+    return payload
+
+
+def response_from_openai(data: dict, body: dict) -> dict:
+    choices = data.get("choices", [])
+    msg = choices[0].get("message", {}) if choices else {}
+    content = msg.get("content") or ""
+    usage = data.get("usage") or {}
+    output_content = []
+    if content:
+        output_content.append({"type": "output_text", "text": content, "annotations": []})
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try: args = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError): args = {}
+        output_content.append({"type": "function_call", "id": tc.get("id", ""), "call_id": tc.get("id", ""),
+                               "name": fn.get("name", ""), "arguments": json.dumps(args, ensure_ascii=False)})
+    return {
+        "id": f"resp_{uuid.uuid4().hex[:24]}", "object": "response",
+        "created_at": data.get("created"), "model": data.get("model") or body.get("model"),
+        "output": [{"id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
+                     "status": "completed", "content": output_content}],
+        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                   "output_tokens": usage.get("completion_tokens", 0),
+                   "total_tokens": usage.get("total_tokens", 0)},
+    }
+
+
+async def _stream_to_responses(openai_response: StreamingResponse, body: dict):
+    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    model = body.get("model", "")
+    created = {"type": "response.created",
+               "response": {"id": resp_id, "object": "response", "model": model, "output": [], "usage": None}}
+    yield f"data: {json.dumps(created, ensure_ascii=False)}\n\n"
+    async for chunk in openai_response.body_iterator:
+        text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("data: ") or line == "data: [DONE]": continue
+            try: payload = json.loads(line[6:])
+            except json.JSONDecodeError: continue
+            if payload.get("error"):
+                yield f"data: {json.dumps({'type': 'error', 'error': payload['error']}, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"; return
+            choice = (payload.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                yield f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': content}, ensure_ascii=False)}\n\n"
+    completed = {"type": "response.completed",
+                 "response": {"id": resp_id, "object": "response", "model": model,
+                              "output": [{"id": msg_id, "type": "message", "role": "assistant", "status": "completed",
+                                          "content": [{"type": "output_text", "text": "", "annotations": []}]}], "usage": {}}}
+    yield f"data: {json.dumps(completed, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+# --- Routes ---
+
+@router.post("/v1/responses")
+@router.post("/responses")
+async def responses_handler(request: Request):
+    raw_body = await request.json()
+    model = raw_body.get("model", "")
+
+    if _is_gpt_model(model):
+        return await _gpt_handle(raw_body, request)
+
+    openai_body = request_to_openai(raw_body)
+    pipeline_response = await ChatPipeline().handle(request, raw_body=openai_body)
+
+    if isinstance(pipeline_response, StreamingResponse):
+        return StreamingResponse(_stream_to_responses(pipeline_response, raw_body),
+                                 media_type="text/event-stream")
+    if isinstance(pipeline_response, JSONResponse):
+        payload = json.loads(pipeline_response.body.decode("utf-8"))
+        if payload.get("error"):
+            return JSONResponse(status_code=pipeline_response.status_code, content=payload)
+        return JSONResponse(status_code=pipeline_response.status_code,
+                            content=response_from_openai(payload, raw_body))
+    return JSONResponse(status_code=500, content={"error": {"message": "Unexpected proxy response", "type": "proxy_error"}})

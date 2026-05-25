@@ -9,7 +9,7 @@ export type CardType =
   | 'promise'
   | 'correction'
   | 'world_state'
-  | 'summary'
+  | 'summary' | 'system_prompt'
 
 export type CardScope = 'global' | 'character' | 'conversation'
 

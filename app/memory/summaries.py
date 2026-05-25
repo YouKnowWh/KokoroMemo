@@ -26,7 +26,7 @@ async def insert_summary(
 ) -> str:
     """Insert a memory summary."""
     summary_id = generate_id("sum_")
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             """INSERT INTO memory_summaries
                (summary_id, level, summary_type, title, content, user_id,
@@ -43,7 +43,7 @@ async def get_active_summaries(
     db_path: str, user_id: str, character_id: str | None = None, level: int | None = None
 ) -> list[dict]:
     """Get active summaries, optionally filtered by level."""
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         db.row_factory = aiosqlite.Row
         query = "SELECT * FROM memory_summaries WHERE status = 'active' AND user_id = ?"
         params: list = [user_id]

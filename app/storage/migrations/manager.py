@@ -63,7 +63,7 @@ async def apply_migrations(target: DatabaseMigrationTarget) -> None:
 
 async def get_schema_version(db_path: str, namespace: str) -> int:
     await _ensure_schema_version_table(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         cursor = await db.execute(
             f"SELECT version FROM {SCHEMA_VERSION_TABLE} WHERE namespace = ?",
             (namespace,),
@@ -74,7 +74,7 @@ async def get_schema_version(db_path: str, namespace: str) -> int:
 
 async def set_schema_version(db_path: str, namespace: str, version: int) -> None:
     await _ensure_schema_version_table(db_path)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             f"""INSERT INTO {SCHEMA_VERSION_TABLE} (namespace, version, applied_at)
                 VALUES (?, ?, datetime('now', 'localtime'))
@@ -88,7 +88,7 @@ async def set_schema_version(db_path: str, namespace: str, version: int) -> None
 
 async def _ensure_schema_version_table(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(db_path, timeout=10.0) as db:
         await db.execute(
             f"""CREATE TABLE IF NOT EXISTS {SCHEMA_VERSION_TABLE} (
                 namespace TEXT PRIMARY KEY,

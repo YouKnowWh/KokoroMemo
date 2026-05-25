@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "/home/ubuntu/apps/kokoromemo/app/main.py", line 192, in _try_bind
+    s.bind((host, port))
+OSError: [Errno 98] Address already in use
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/ubuntu/apps/kokoromemo/app/main.py", line 257, in <module>
+    port, port_unavailable_reason = _find_available_port(host, cfg.server.port)
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/apps/kokoromemo/app/main.py", line 201, in _find_available_port
+    raise RuntimeError(
+RuntimeError: Configured server port 127.0.0.1:14514 is not available: 已被其他进程监听

@@ -97,12 +97,22 @@ app.state.actual_port = None
 def create_app() -> FastAPI:
     """创建并配置 FastAPI 应用。"""
     from app.api.routes_admin import router as admin_router
+    from app.api.routes_anthropic import router as anthropic_router
+    from app.api.routes_gemini import router as gemini_router
+    from app.api.routes_status import router as status_router
     from app.api.routes_openai import router as openai_router
+    from app.api.routes_responses import router as responses_router
     from app.api.routes_ws import router as ws_router
+    from app.api.routes_agent import router as agent_router
 
     app.include_router(admin_router)
+    app.include_router(anthropic_router)
+    app.include_router(gemini_router)
+    app.include_router(status_router)
     app.include_router(openai_router)
+    app.include_router(responses_router)
     app.include_router(ws_router)
+    app.include_router(agent_router)
 
     if not _android_compat_enabled():
         app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -119,7 +129,7 @@ def create_app() -> FastAPI:
     if _gui_dist.is_dir():
         app.mount("/assets", CacheStaticFiles(directory=_gui_dist / "assets"), name="static-assets")
 
-        _API_PREFIXES = ("/admin", "/v1", "/health", "/ws")
+        _API_PREFIXES = ("/admin", "/v1", "/v1beta", "/anthropic", "/responses", "/health", "/ws")
 
         @app.get("/.port")
         async def serve_actual_port():
@@ -186,6 +196,7 @@ def _find_available_port(host: str, preferred: int) -> tuple[int, str | None]:
     def _try_bind(port: int) -> tuple[bool, OSError | None]:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((host, port))
                 return True, None
         except OSError as exc:
